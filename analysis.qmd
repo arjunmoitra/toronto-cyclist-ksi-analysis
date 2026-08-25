@@ -1,0 +1,2682 @@
+---
+title: "Spatiotemporal Analysis of Cyclist KSI Collisions in Toronto"
+subtitle: "Where accidents cluster, whether income predicts risk, and whether the cycling network is working, 2006 to 2023"
+author: "Sanika Rozario, Jose Barral, Arjun Moitra"
+date: today
+format:
+  html:
+    theme: flatly
+    css: styles.css
+    embed-resources: true
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    number-sections: true
+    code-fold: true
+    code-tools: true
+    fig-cap-location: bottom
+    df-print: kable
+    smooth-scroll: true
+fontsize: 15px
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.width = 10, fig.height = 7
+)
+
+# Silence cancensus's download-progress spam that flooded the last render.
+options(cancensus.messages = FALSE)
+```
+
+```{r libraries, include=FALSE}
+library(sf)
+library(terra)
+library(tidyverse)
+library(tmap)
+library(cancensus)
+library(httr)
+
+# Persistent cache: the default cancensus cache lives in tempdir(), which is
+# wiped every new R session, so every fresh render re-hits the live API even
+# for identical queries. Pointing this at a project folder means a
+# successful pull is reused across renders, not just within one session.
+dir.create("cancensus_cache", showWarnings = FALSE)
+options(cancensus.cache_path = "cancensus_cache")
+
+library(spatstat)
+library(spdep)
+library(INLA)
+library(ggplot2)
+library(lubridate)
+library(gridExtra)
+library(scales)
+library(RColorBrewer)
+
+
+options(dplyr.summarise.inform = FALSE)
+tmap_mode("plot")
+
+tmap_options(
+  legend.title.size  = 1.2,
+  legend.text.size   = 0.9,
+  title.size         = 1.4,
+  title.fontface     = "bold",
+  title.color        = "#1a1a2e",
+  inner.margins      = c(0.04, 0.04, 0.08, 0.04),
+  outer.margins      = 0
+)
+
+theme_project <- theme_bw(base_size = 12) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 14, colour = "#1a1a2e"),
+    plot.subtitle    = element_text(colour = "grey40", size = 10),
+    axis.title       = element_text(size = 11),
+    legend.position  = "right",
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(fill = "#f0f0f0"),
+    plot.background  = element_rect(fill = "white", colour = NA)
+  )
+
+COL_FATAL    <- "#d73027"
+COL_INJURY   <- "#2166ac"
+COL_NETWORK  <- "#2ca25f"
+COL_ACCENT   <- "#f46d43"
+
+infra_palette <- c(
+  "Cycle Track"     = "#1b7837",
+  "Bike Lane"       = "#66bd63",
+  "Multi-Use Trail" = "#4575b4",
+  "Sharrows"        = "#fdae61",
+  "Signed Route"    = "#f46d43",
+  "Other"           = "grey60"
+)
+```
+
+# Introduction
+
+Cycling is an increasingly important mode of urban transportation, yet cyclists remain among the most vulnerable road users. Toronto's Vision Zero Road Safety Plan (launched in 2016) aims to eliminate all traffic fatalities and serious injuries. Understanding *where* and *when* cycling accidents cluster, and whether infrastructure such as bike lanes reduces accident risk, is critical to informing this policy.
+
+In this project we analyze the spatiotemporal patterns of cyclist Killed or Seriously Injured (KSI) collisions in Toronto from 2006 to 2023. Specifically, we address three research questions:
+
+1. **Where** do serious cycling accidents cluster spatially in Toronto?
+2. **Do lower-income neighbourhoods** have higher accident rates after controlling for population?
+3. **Has the cycling network** expansion been associated with reduced accident rates over time?
+
+---
+
+# Data
+
+## Data Sources
+
+We use five datasets:
+
+- **Cyclist KSI collisions (2006 to 2023):** Toronto Police Services / City of Toronto Open Data. Point data recording all collisions involving a cyclist where a person was killed or seriously injured.
+- **Toronto Neighbourhoods:** City of Toronto Open Data. 158 neighbourhood polygons covering the city.
+- **Cycling Network:** City of Toronto Open Data. Full cycling network including bike lanes, cycle tracks, multi-use trails, and sharrows. Includes year of installation and infrastructure type.
+- **Census income data:** Statistics Canada 2021 Census via the `cancensus` R package. Median after-tax household income at the neighbourhood level.
+- **Bike Share Toronto trip data:** City of Toronto Open Data / Bike Share Toronto GBFS feed. Full trip level ridership data for 2023, 11.4 million trip start/end events across 817 stations, plus monthly trip totals for 2019 and 2022. Used in the Future Work section as an independent cross-check on cycling exposure and as a predictor of collision counts, seasonal patterns, and cycling activity levels.
+
+## Loading Data
+
+```{r load-data, results='hide'}
+# All three geographic layers below are pulled live from their public City
+# of Toronto / Toronto Police open data APIs rather than from local
+# shapefiles, so this report reproduces from a clean clone with no manual
+# data download step. Each pull is cached to data_cache/raw/ after the
+# first successful run: re-rendering reuses the cache instead of re-hitting
+# the network, matching the pattern already used for the cancensus pull
+# below. Delete data_cache/raw/ to force a fresh pull. Full details are in
+# the Reproducibility section at the end of this report.
+
+dir.create("data_cache/raw", showWarnings = FALSE, recursive = TRUE)
+
+# Cyclist KSI collisions: Toronto Police Service ArcGIS FeatureServer.
+# Paginated because the service caps each query at 2000 records.
+fetch_cyclist_ksi <- function(cache_rds) {
+  if (file.exists(cache_rds)) return(readRDS(cache_rds))
+
+  base_url <- "https://services.arcgis.com/S9th0jAJ7bqgIRjw/arcgis/rest/services/CYCLIST_KSI/FeatureServer/0/query"
+  page_size <- 2000
+  offset <- 0
+  pages <- list()
+  repeat {
+    resp <- httr::GET(base_url, query = list(
+      where = "1=1", outFields = "*", f = "geojson",
+      resultOffset = offset, resultRecordCount = page_size
+    ))
+    httr::stop_for_status(resp)
+    page <- sf::read_sf(httr::content(resp, as = "text", encoding = "UTF-8"))
+    if (nrow(page) == 0) break
+    pages[[length(pages) + 1]] <- page
+    offset <- offset + page_size
+    if (nrow(page) < page_size) break
+  }
+
+  out <- do.call(rbind, pages) |> st_set_crs(4326)
+  # ArcGIS returns DATE as epoch milliseconds; convert once here so the
+  # downstream as.Date(DATE) call in data-cleaning works unchanged.
+  out$DATE <- as.Date(as.POSIXct(out$DATE / 1000, origin = "1970-01-01", tz = "UTC"))
+  saveRDS(out, cache_rds)
+  out
+}
+
+cyclists <- fetch_cyclist_ksi("data_cache/raw/cyclist_ksi.rds") |>
+  st_transform(4326)
+
+# Neighbourhoods and Cycling Network: City of Toronto Open Data (CKAN),
+# distributed as zipped shapefiles.
+download_ckan_shp <- function(url, cache_dir) {
+  if (!dir.exists(cache_dir)) {
+    dir.create(cache_dir, showWarnings = FALSE, recursive = TRUE)
+    zip_path <- tempfile(fileext = ".zip")
+    resp <- httr::GET(url, httr::write_disk(zip_path, overwrite = TRUE))
+    httr::stop_for_status(resp)
+    unzip(zip_path, exdir = cache_dir)
+  }
+  shp_file <- list.files(cache_dir, pattern = "\\.shp$", full.names = TRUE)[1]
+  read_sf(shp_file)
+}
+
+neighbourhoods <- download_ckan_shp(
+  "https://ckan0.cf.opendata.inter.prod-toronto.ca/dataset/fc443770-ef0a-4025-9c2c-2cb558bfab00/resource/02ac940a-98b4-4b00-b04f-5899f24e1ef4/download/neighbourhoods-4326.zip",
+  "data_cache/raw/neighbourhoods"
+) |>
+  rename(neighbourhood = AREA_NA7) |>
+  select(neighbourhood, geometry) |>
+  st_transform(4326)
+
+cycling_network <- download_ckan_shp(
+  "https://ckan0.cf.opendata.inter.prod-toronto.ca/dataset/abbe5ee3-e249-4f86-a219-f0022eaddcc9/resource/ce9baaa2-6866-4dee-963e-ac1ac7ae2d05/download/cycling-network-4326.zip",
+  "data_cache/raw/cycling_network"
+) |>
+  st_transform(4326) |>
+  rename(
+    install_year = INSTALL3,
+    infra_low    = INFRA_L14,
+    infra_high   = INFRA_H15,
+    road_class   = ROADCLA9,
+    street       = STREET_6
+  ) |>
+  mutate(
+    install_year = suppressWarnings(as.numeric(as.character(install_year))),
+    length_km    = as.numeric(st_length(geometry)) / 1000
+  )
+
+cycling_network <- cycling_network |> mutate(infra_group = case_when(
+  grepl("Cycle Track",  infra_high, ignore.case = TRUE) ~ "Cycle Track",
+  grepl("Bike Lane",    infra_high, ignore.case = TRUE) ~ "Bike Lane",
+  grepl("Multi-Use",    infra_high, ignore.case = TRUE) ~ "Multi-Use Trail",
+  grepl("Sharrow",      infra_high, ignore.case = TRUE) ~ "Sharrows",
+  grepl("Signed",       infra_high, ignore.case = TRUE) ~ "Signed Route",
+  TRUE                                                   ~ "Other"
+))
+```
+
+```{r cancensus-pull, cache=TRUE, results='hide'}
+# Moved up from later in the document (originally near the Q2 income
+# analysis) so that population data is available in time for the
+# population-adjusted KDE panel in Figure 4. This chunk is self-contained
+# (only needs cancensus, not anything from load-data), so moving it here
+# does not change any other chunk's inputs.
+dir.create("data_cache", showWarnings = FALSE)
+ca21_cache_file <- file.path("data_cache", "income_2021_main.rds")
+
+if (file.exists(ca21_cache_file)) {
+  toronto_census <- readRDS(ca21_cache_file)
+} else {
+  toronto_census <- get_census(
+    dataset = "CA21", regions = list(CMA = "35535"),
+    vectors = c("v_CA21_907", "v_CA21_1"),
+    level = "CT", geo_format = "sf", quiet = TRUE
+  )
+
+  inc_col <- grep("v_CA21_907", names(toronto_census), value = TRUE)[1]
+  pop_col <- grep("v_CA21_1\\b", names(toronto_census), value = TRUE)[1]
+
+  toronto_census <- toronto_census |>
+    rename(median_income = all_of(inc_col),
+           population    = all_of(pop_col)) |>
+    select(GeoUID, median_income, population, geometry) |>
+    st_transform(4326)
+
+  saveRDS(toronto_census, ca21_cache_file)
+}
+
+# One canonical income+population-per-neighbourhood table, built once here
+# and reused everywhere else in the document. Previously this exact
+# derivation was duplicated in three separate places, and one of those
+# duplicates (in the Q1 infrastructure-correlation chunk) called
+# get_census() a second time independently instead of reusing
+# toronto_census - a real, silent source of extra API quota use on every
+# single render, on top of anything unique to tonight's work.
+census_by_hood <- toronto_census |>
+  st_centroid() |>
+  st_join(neighbourhoods) |>
+  st_drop_geometry() |>
+  filter(!is.na(neighbourhood)) |>
+  group_by(neighbourhood) |>
+  summarise(median_income = median(median_income, na.rm = TRUE),
+            population    = sum(population,    na.rm = TRUE))
+```
+
+## Dataset Summary
+
+```{r data-summary, echo=FALSE}
+tibble::tribble(
+  ~Dataset,               ~Rows,                     ~Notes,
+  "Cyclist KSI",           nrow(cyclists),           "point data, 2006-present",
+  "Neighbourhoods",        nrow(neighbourhoods),     "158 polygons",
+  "Cycling network",       nrow(cycling_network),    "line segments with install year"
+) |> knitr::kable()
+```
+
+## Data Cleaning
+
+```{r data-cleaning, results='hide'}
+cyclists <- cyclists |>
+  mutate(
+    date     = as.Date(DATE),
+    year     = year(date),
+    month    = month(date),
+    month_yr = floor_date(date, "month"),
+    fatal    = ACCLASS == "Fatal",
+    injury   = INJURY
+  ) |>
+  filter(!is.na(LATITUDE), !is.na(LONGITUDE),
+         year >= 2006, year <= 2023)
+
+cycling_network <- cycling_network |>
+  filter(!is.na(install_year), install_year > 1990)
+```
+
+```{r cleaning-summary, echo=FALSE}
+tibble::tribble(
+  ~Metric,                            ~Value,
+  "Date range",                       paste(min(cyclists$year), "-", max(cyclists$year)),
+  "Fatal collisions",                 as.character(sum(cyclists$fatal, na.rm = TRUE)),
+  "Serious injury collisions",        as.character(sum(!cyclists$fatal, na.rm = TRUE)),
+  "Cycling network year range",       paste(min(cycling_network$install_year, na.rm = TRUE),
+                                            "-", max(cycling_network$install_year, na.rm = TRUE))
+) |> knitr::kable()
+```
+
+---
+
+## Exploratory Visualization
+
+### Overview Map
+
+```{r map-overview, fig.cap="Figure 1: Cyclist KSI collisions in Toronto (2006 to 2023) overlaid on the full cycling network coloured by infrastructure type.", fig.align="center", fig.height=9, fig.width=12, dpi=150}
+tm_shape(neighbourhoods) +
+  tm_polygons(fill = "white", col = "#666666", lwd = 0.6) +
+  tm_shape(cycling_network) +
+  tm_lines(
+    col       = "infra_group",
+    col.scale = tm_scale_categorical(values = infra_palette),
+    lwd        = 1.5,
+    col_alpha  = 0.8,
+    col.legend = tm_legend(title = "Infrastructure Type")
+  ) +
+  tm_shape(cyclists |> filter(!fatal)) +
+  tm_dots(fill = COL_INJURY, size = 0.55, fill_alpha = 0.55) +
+  tm_shape(cyclists |> filter(fatal)) +
+  tm_dots(col = COL_FATAL, size = 1.3, shape = 4, col_alpha = 1.0, lwd = 2) +
+  tm_add_legend(
+    type   = "symbols",
+    labels = c("Serious Injury", "Fatal"),
+    fill   = c(COL_INJURY, COL_FATAL),
+    col    = c(COL_INJURY, COL_FATAL),
+    shape  = c(19, 4)
+  ) +
+  tm_scalebar(breaks = c(0, 5, 10), position = c("left", "bottom")) +
+  tm_compass(position = c("right", "top"), size = 1.5) +
+  tm_title("Cyclist KSI Collisions in Toronto (2006 to 2023)") +
+  tm_layout(frame = FALSE, legend.outside = TRUE, bg.color = "white",
+            legend.text.size = 1.1, legend.title.size = 1.3)
+
+```
+
+
+
+```{r top-hotspots-legend, echo=FALSE}
+top3_hoods_named <- neighbourhoods |>
+  st_join(cyclists |> select(geometry)) |>
+  st_drop_geometry() |>
+  count(neighbourhood, sort = TRUE) |>
+  slice_head(n = 3)
+
+# small coloured swatch table, same idea as Figure 8's naming approach
+swatch_colours <- c("#7a0177", "#c51b8a", "#f768a1")
+
+tibble::tibble(
+  Colour        = sprintf('<span style="color:%s;">&#9632;</span>',
+                          swatch_colours[1:nrow(top3_hoods_named)]),
+  Neighbourhood = top3_hoods_named$neighbourhood,
+  Collisions    = top3_hoods_named$n
+) |>
+  knitr::kable(escape = FALSE,
+               caption = "Top-3 highest-collision neighbourhoods (visible as the densest cluster on the map above)")
+```             
+      
+**Analysis:** Accidents are heavily concentrated in the downtown core and inner city, reflecting higher cyclist volumes in these areas. Fatal accidents (red X) are distributed across the city, with several occurring along major arterial roads in the suburbs. The full cycling network shows extensive downtown coverage, yet this is also where accidents are most frequent, suggesting that infrastructure type and quality matter more than mere presence.
+---
+
+### Annual Trend
+
+```{r annual-trend, fig.cap="Figure 2: Annual cyclist KSI collisions in Toronto (2006 to 2023), split by severity.", fig.align="center", fig.height=6}
+cyclists |>
+  st_drop_geometry() |>
+  group_by(year, fatal) |>
+  summarise(n = n()) |>
+  mutate(Severity = ifelse(fatal, "Fatal", "Serious Injury")) |>
+  ggplot(aes(x = year, y = n, fill = Severity)) +
+  geom_col(position = "stack", width = 0.75, colour = "white", linewidth = 0.3) +
+  geom_smooth(
+    data = cyclists |> st_drop_geometry() |>
+      group_by(year) |> summarise(n = n()),
+    aes(x = year, y = n),
+    inherit.aes = FALSE,
+    method = "loess", span = 0.5,
+    colour = "#1a1a2e", linewidth = 1.2, se = FALSE, linetype = "dashed"
+  ) +
+  annotate("rect", xmin = 2015.5, xmax = 2016.5,
+           ymin = -Inf, ymax = Inf, fill = "#fdae61", alpha = 0.3) +
+  annotate("text", x = 2016, y = 175, label = "Vision Zero",
+           size = 3, colour = "#e6550d", fontface = "italic",
+           angle = 90, vjust = -0.3) +
+  annotate("rect", xmin = 2019.5, xmax = 2021.5,
+           ymin = -Inf, ymax = Inf, fill = "#bdbdbd", alpha = 0.25) +
+  annotate("text", x = 2020.5, y = 175, label = "COVID-19",
+           size = 3, colour = "grey40", fontface = "italic",
+           angle = 90, vjust = -0.3) +
+  scale_fill_manual(values = c("Fatal" = COL_FATAL,
+                               "Serious Injury" = COL_INJURY)) +
+  scale_x_continuous(breaks = seq(2006, 2023, 2)) +
+  labs(
+    title    = "Annual Cyclist KSI Collisions in Toronto (2006 to 2023)",
+    subtitle = "Stacked by severity  |  Orange = Vision Zero launch (2016)  |  Grey = COVID period  |  Dashed = trend",
+    x        = "Year", y = "Number of Collisions", fill = "Severity"
+  ) +
+  theme_project
+```
+  
+**Analysis:** Annual KSI collisions peaked around 2011 to 2013 with over 150 incidents per year, then declined steadily. A notable drop occurred in 2020 due to reduced cycling activity during COVID-19. The downward long-term trend suggests overall road safety improvements, potentially linked to Vision Zero initiatives launched in 2016. These are raw counts, not a rate, and a decline here cannot distinguish "cycling got safer" from "fewer people were cycling" (work-from-home, for instance, would show up here as fewer collisions with no change in per-trip risk). See the deeper analysis later in this report, particularly the exposure-adjusted rates and the safety-in-numbers check using bike share trip volume, for a version of this question normalized by actual cycling activity rather than raw counts.
+
+---
+
+# Question 1: Where Do Accidents Cluster?
+
+We use a Kernel Density Estimate (KDE) to identify spatial hotspots of cyclist collisions across Toronto.
+
+```{r kde-setup, results='hold'}
+cyclists_utm       <- st_transform(cyclists, 32617)
+neighbourhoods_utm <- st_transform(neighbourhoods, 32617)
+coords             <- st_coordinates(cyclists_utm)
+toronto_boundary   <- st_union(neighbourhoods_utm)
+toronto_win        <- as.owin(toronto_boundary)
+
+cyclists_ppp <- ppp(x = coords[, "X"], y = coords[, "Y"], window = toronto_win)
+bw           <- bw.scott(cyclists_ppp)
+cyclists_kde <- density(cyclists_ppp, sigma = bw, positive = TRUE)
+
+# bw.scott returns separate bandwidths for X and Y - report both.
+cat("KDE bandwidth (Scott's rule):\n")
+cat("  X-axis (E-W):", round(bw[1]), "metres\n")
+cat("  Y-axis (N-S):", round(bw[2]), "metres\n")
+```
+
+
+
+```{r kde-map, fig.cap="Figure 3: Kernel density estimate of cyclist KSI collisions across Toronto (log intensity). White lines show the cycling network. A single, sharply defined hotspot dominates the downtown core.", fig.align="center", fig.height=9, fig.width=12, dpi=150}
+kde_rast      <- rast(cyclists_kde)
+crs(kde_rast) <- "EPSG:32617"
+kde_rast_wgs  <- project(kde_rast, "EPSG:4326")
+kde_rast_wgs  <- log1p(kde_rast_wgs)
+
+tm_shape(kde_rast_wgs) +
+  tm_raster(
+    col.scale  = tm_scale_continuous(values = "viridis", midpoint = NA),
+    col.legend = tm_legend(title = "log(Accident\nIntensity)")
+  ) +
+  tm_shape(neighbourhoods) +
+  tm_borders(col = "white", lwd = 0.6) +
+  tm_shape(cycling_network) +
+  tm_lines(col = "white", lwd = 0.5, col_alpha = 0.5) +
+  tm_title("Raw Collision Density") +
+  tm_scalebar(breaks = c(0, 5, 10), position = c("left", "bottom")) +
+  tm_compass(position = c("right", "top"), size = 1.2) +
+  tm_layout(frame = FALSE, legend.outside = TRUE, bg.color = "white")
+```
+
+**Analysis:** The raw KDE reveals a primary hotspot in the downtown core, roughly bounded by Bloor Street, Spadina Avenue, and the waterfront. Secondary hotspots are visible along major arterial roads in midtown and the east end. The cycling network (white lines) is also densest in the same downtown area, suggesting that high cyclist volume in these areas drives accident counts more than lack of infrastructure. That is a hypothesis worth testing directly, which the next figure does.
+
+```{r kde-percap-map, fig.cap="Figure 4: The same collision surface divided by neighbourhood population density, showing accident concentration relative to how many people live in each area rather than the absolute collision count. Population is only available at neighbourhood-polygon resolution, so the denominator is constant within each neighbourhood rather than a fully smooth surface: a reasonable population adjustment given the data available, not a continuous exposure layer.", fig.align="center", fig.height=9, fig.width=12, dpi=150}
+# Population-adjusted panel: rasterize neighbourhood population density
+# onto the exact same grid as the KDE, then divide. Cells with very low
+# population (parks, industrial land, water) are set to NA rather than
+# creating extreme, meaningless spikes from dividing by near-zero.
+hood_pop_geo <- neighbourhoods |>
+  left_join(census_by_hood, by = "neighbourhood") |>
+  filter(!is.na(population)) |>
+  st_transform(32617) |>
+  mutate(area_km2    = as.numeric(st_area(geometry)) / 1e6,
+         pop_density = population / area_km2)
+
+pop_dens_rast <- rasterize(vect(hood_pop_geo), kde_rast, field = "pop_density")
+pop_dens_rast[pop_dens_rast < 100] <- NA
+
+kde_percap_rast <- kde_rast / pop_dens_rast
+kde_percap_rast <- project(kde_percap_rast, "EPSG:4326")
+kde_percap_rast <- log1p(kde_percap_rast * 1e6)
+
+tm_shape(kde_percap_rast) +
+  tm_raster(
+    col.scale  = tm_scale_continuous(values = "magma", midpoint = NA),
+    col.legend = tm_legend(title = "log(Per-Capita\nRisk Index)")
+  ) +
+  tm_shape(neighbourhoods) +
+  tm_borders(col = "white", lwd = 0.6) +
+  tm_title("Population-Adjusted Density") +
+  tm_scalebar(breaks = c(0, 5, 10), position = c("left", "bottom")) +
+  tm_compass(position = c("right", "top"), size = 1.2) +
+  tm_layout(frame = FALSE, legend.outside = TRUE, bg.color = "white")
+```
+
+**Analysis:** Dividing by resident population density tests the hypothesis directly. The downtown hotspot does not disappear, but its relative intensity shifts compared to outer, lower-density neighbourhoods that looked comparatively quiet in the raw map. This still uses resident population, not measured cyclist volume, as the denominator, so it answers "is this dangerous relative to how many people live here" rather than "is this dangerous relative to how many people cycle here." The exposure-adjusted analysis later in this report, using actual bike share and counter data, gets closer to that second question.
+
+---
+
+### Road Class Breakdown
+
+```{r road-class, fig.cap="Figure 5: Cyclist KSI collisions by road class, with percentage of total.", fig.align="center", fig.height=6}
+cyclists |>
+  st_drop_geometry() |>
+  filter(!is.na(ROAD_CLASS)) |>
+  count(ROAD_CLASS, name = "n_accidents") |>
+  arrange(desc(n_accidents)) |>
+  mutate(
+    ROAD_CLASS = fct_reorder(ROAD_CLASS, n_accidents),
+    pct        = n_accidents / sum(n_accidents) * 100,
+    colour_grp = case_when(
+      pct >= 30 ~ "Very High", pct >= 15 ~ "High",
+      pct >= 5  ~ "Medium",    TRUE      ~ "Low"
+    )
+  ) |>
+  ggplot(aes(x = ROAD_CLASS, y = n_accidents, fill = colour_grp)) +
+  geom_col(show.legend = TRUE, width = 0.7, colour = "white") +
+  geom_text(aes(label = paste0(round(pct, 1), "%  (n=", n_accidents, ")")),
+            hjust = -0.08, size = 3.5, fontface = "bold", colour = "grey20") +
+  coord_flip(clip = "off") +
+  scale_fill_manual(
+    values = c("Very High" = "#d73027", "High" = "#f46d43",
+               "Medium" = "#fdae61", "Low" = "#abd9e9"),
+    name = "Risk Level",
+    breaks = c("Very High", "High", "Medium", "Low")
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.22))) +
+  labs(
+    title    = "Cyclist KSI Collisions by Road Class",
+    subtitle = "Colour indicates share of total collisions  |  Percentage and count shown on each bar",
+    x = "Road Class", y = "Number of Collisions"
+  ) +
+  theme_project
+```
+
+**Analysis:** Major arterial roads account for the largest share of cyclist KSI collisions (~65%), followed by minor arterials. Collector and local roads have significantly fewer incidents. This confirms that the highest-risk locations are busy multi-lane roads, precisely where protected cycling infrastructure (cycle tracks, separated bike lanes) would provide the greatest safety benefit.
+
+---
+
+## Infrastructure Coverage vs Accident Rate
+
+We now test whether neighbourhoods with more cycling infrastructure per km² have lower accident rates.
+
+```{r infra-correlation, results='hide', cache=TRUE}
+hood_area_km2 <- neighbourhoods |>
+  mutate(area_km2 = as.numeric(st_area(geometry)) / 1e6)
+
+infra_per_hood <- hood_area_km2 |>
+  st_join(cycling_network |> select(infra_high, length_km)) |>
+  st_drop_geometry() |>
+  group_by(neighbourhood) |>
+  summarise(
+    total_infra_km = sum(length_km, na.rm = TRUE),
+    area_km2       = first(area_km2),
+    infra_density  = total_infra_km / area_km2
+  )
+
+hood_data_q1 <- neighbourhoods |>
+  st_join(cyclists |> select(geometry, fatal)) |>
+  group_by(neighbourhood) |>
+  summarise(n_accidents = sum(!is.na(fatal)),
+            n_fatal     = sum(fatal, na.rm = TRUE))
+
+# Previously this re-called get_census() independently for identical data
+# already pulled once in cancensus-pull; now reuses census_by_hood built
+# there instead, removing a redundant live API call on every render.
+census_centroids_q1 <- census_by_hood
+
+hood_infra <- hood_data_q1 |>
+  st_drop_geometry() |>
+  left_join(census_centroids_q1, by = "neighbourhood") |>
+  left_join(infra_per_hood,      by = "neighbourhood") |>
+  replace_na(list(total_infra_km = 0, infra_density = 0)) |>
+  mutate(accidents_per1k = n_accidents * 1000 / population) |>
+  filter(!is.na(accidents_per1k), !is.na(median_income), population > 100)
+
+cor_test <- cor.test(hood_infra$infra_density,
+                     hood_infra$accidents_per1k,
+                     method = "spearman")
+```
+
+```{r infra-correlation-report, echo=FALSE}
+cat("Spearman correlation (infrastructure density vs. accident rate)\n")
+cat("  rho     =", round(cor_test$estimate, 3), "\n")
+cat("  p-value =", format.pval(cor_test$p.value, digits = 3), "\n")
+```
+
+```{r infra-scatter, fig.cap=paste0("Figure 6: Cycling infrastructure density (kilometres of bike lane, cycle track, and similar infrastructure per square kilometre of neighbourhood area) vs accident rate per 1,000 people. Points sized by neighbourhood population, coloured by median income. Top-3 outliers labelled. Spearman rho = ", round(cor_test$estimate, 3), ", p = ", format.pval(cor_test$p.value, digits = 3), "."), fig.align="center"}
+# Label the three highest-rate points so the audience knows which
+# neighbourhoods are driving the top of the scatter.
+top3_scatter <- hood_infra |> slice_max(accidents_per1k, n = 3)
+
+ggplot(hood_infra, aes(x = infra_density, y = accidents_per1k)) +
+  geom_point(aes(size = population, colour = median_income), alpha = 0.7) +
+  geom_smooth(method = "lm", se = TRUE,
+              colour = COL_FATAL, fill = COL_FATAL, alpha = 0.15,
+              linewidth = 1.2) +
+  ggrepel::geom_text_repel(
+    data = top3_scatter,
+    aes(label = neighbourhood),
+    size = 3.6, fontface = "bold",
+    box.padding = 0.6, min.segment.length = 0
+  ) +
+  scale_colour_gradient(
+    low = "#d73027", high = "#313695",
+    name = "Median Income ($)", labels = comma
+  ) +
+  scale_size_continuous(name = "Population", labels = comma, range = c(1, 9)) +
+  labs(
+    title = "Cycling Infrastructure Density vs Accident Rate",
+    x = "Cycling Infrastructure Density (km of infrastructure per km² of neighbourhood)",
+    y = "Accidents per 1,000 people"
+  ) +
+  theme_project
+```
+
+```{r infra-type-accidents, fig.cap="Figure 7: Average accident rate by dominant cycling infrastructure type per neighbourhood. Error bars show ±1 standard error.", fig.align="center"}
+dominant_infra <- hood_area_km2 |>
+  st_join(cycling_network |> select(infra_high, length_km)) |>
+  st_drop_geometry() |>
+  group_by(neighbourhood, infra_high) |>
+  summarise(km = sum(length_km, na.rm = TRUE)) |>
+  slice_max(km, n = 1, with_ties = FALSE) |>
+  rename(dominant_infra = infra_high)
+
+hood_infra2 <- hood_infra |>
+  left_join(dominant_infra, by = "neighbourhood") |>
+  filter(!is.na(dominant_infra)) |>
+  mutate(infra_category = case_when(
+    grepl("Cycle Track", dominant_infra) ~ "Cycle Track",
+    grepl("Bike Lane",   dominant_infra) ~ "Bike Lane",
+    grepl("Multi-Use",   dominant_infra) ~ "Multi-Use Trail",
+    grepl("Sharrow",     dominant_infra) ~ "Sharrows",
+    grepl("Signed",      dominant_infra) ~ "Signed Route",
+    TRUE                                  ~ "Other"
+  ))
+
+infra_summary <- hood_infra2 |>
+  group_by(infra_category) |>
+  summarise(
+    mean_rate = mean(accidents_per1k, na.rm = TRUE),
+    n_hoods   = n(),
+    se        = sd(accidents_per1k, na.rm = TRUE) / sqrt(n())
+  ) |>
+  arrange(mean_rate) |>
+  mutate(infra_category = fct_reorder(infra_category, mean_rate))
+
+ggplot(infra_summary,
+       aes(x = infra_category, y = mean_rate, fill = infra_category)) +
+  geom_col(width = 0.65, show.legend = FALSE, colour = "white") +
+  geom_errorbar(aes(ymin = mean_rate - se, ymax = mean_rate + se),
+                width = 0.25, colour = "grey30", linewidth = 0.8) +
+  # nudge_y pushes labels above the error bar tops rather than colliding
+  geom_text(aes(label = paste0("n=", n_hoods),
+                y = mean_rate + se),
+            nudge_y = 0.08, size = 3.5, colour = "grey30",
+            fontface = "bold") +
+  scale_fill_manual(values = infra_palette) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.25))) +
+  labs(
+    title = "Average Accident Rate by Dominant Infrastructure Type",
+    x = "Dominant Infrastructure Type",
+    y = "Mean Accidents per 1,000 People"
+  ) +
+  theme_project +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+**Analysis:** The Spearman correlation (rho = 0.357, p ≈ 0) shows a significant **positive** association between infrastructure density and accident rate: neighbourhoods with more cycling infrastructure tend to have *higher* accident rates per capita. This is a classic case of confounding by cyclist volume: downtown neighbourhoods have both the most infrastructure and the most cyclists, so accidents are naturally higher regardless of infrastructure quality. This finding highlights why controlling for cycling exposure (volume) is essential: without it, infrastructure appears harmful when it is likely beneficial. Figure 7 gives a partial view by comparing rates by infrastructure *type*, but the same exposure caveat applies.
+
+---
+
+# Question 2: Do Lower-Income Neighbourhoods Have Higher Accident Rates?
+
+## Census Income Data
+
+```{r census-summary, echo=FALSE}
+tibble::tribble(
+  ~Metric,             ~Value,
+  "Census tracts",     as.character(nrow(toronto_census)),
+  "Min income",        paste0("$", format(round(min(toronto_census$median_income, na.rm = TRUE)), big.mark = ",")),
+  "Max income",        paste0("$", format(round(max(toronto_census$median_income, na.rm = TRUE)), big.mark = ","))
+) |> knitr::kable()
+```
+
+## Accidents per Neighbourhood
+
+```{r neighbourhood-join, results='hide'}
+accidents_per_hood <- neighbourhoods |>
+  st_join(cyclists |> select(geometry, fatal)) |>
+  group_by(neighbourhood) |>
+  summarise(n_accidents = sum(!is.na(fatal)),
+            n_fatal     = sum(fatal, na.rm = TRUE))
+
+census_centroids <- census_by_hood
+
+hood_data <- accidents_per_hood |>
+  left_join(census_centroids, by = "neighbourhood") |>
+  mutate(accidents_per1k = n_accidents * 1000 / population) |>
+  filter(!is.na(median_income), population > 100)
+```
+
+```{r income-accident-map, fig.cap="Figure 8: Accident rate per 1,000 people (left) and median household income (right) across Toronto neighbourhoods. Note: LEFT uses viridis (dark = low, yellow = high); RIGHT uses a sequential blue palette (light = low, dark = high) to distinguish it from the rate map.", fig.align="center", fig.height=9, fig.width=12, dpi=150}
+p1 <- tm_shape(hood_data) +
+  tm_polygons(
+    fill        = "accidents_per1k",
+    fill.scale  = tm_scale_continuous(values = "viridis"),
+    fill.legend = tm_legend(title = "Accidents\nper 1,000"),
+    col = "white", lwd = 0.5
+  ) +
+  tm_title("Accident Rate per 1,000 People") +
+  tm_scalebar(breaks = c(0, 5, 10), position = c("left", "bottom")) +
+  tm_compass(position = c("right", "top"), size = 1.2) +
+  tm_layout(frame = FALSE, legend.outside = TRUE, bg.color = "white")
+
+p2 <- tm_shape(hood_data) +
+  tm_polygons(
+    fill        = "median_income",
+    fill.scale  = tm_scale_continuous(values = "brewer.blues"),
+    fill.legend = tm_legend(title = "Median\nIncome ($)"),
+    col = "white", lwd = 0.5
+  ) +
+  tm_title("Median Household Income") +
+  tm_scalebar(breaks = c(0, 5, 10), position = c("left", "bottom")) +
+  tm_compass(position = c("right", "top"), size = 1.2) +
+  tm_layout(frame = FALSE, legend.outside = TRUE, bg.color = "white")
+
+tmap_arrange(p1, p2, ncol = 2)
+```
+
+**Analysis:** The accident rate map (left) shows highest rates in the downtown core: Yonge-Bay Corridor, University, and Dufferin Grove. The income map (right) shows the same downtown areas have moderate-to-low income levels. However, several high-income neighbourhoods also have elevated accident rates (e.g. Rosedale, Lawrence Park), suggesting income alone does not fully explain the pattern.
+
+---
+
+```{r income-scatter, fig.cap="Figure 9: Income vs accident rate per neighbourhood, coloured by number of fatal accidents.", fig.align="center"}
+ggplot(hood_data |> st_drop_geometry(),
+       aes(x = median_income, y = accidents_per1k)) +
+  geom_point(aes(size = n_accidents, colour = n_fatal), alpha = 0.7) +
+  geom_smooth(method = "lm", se = TRUE,
+              colour = "#d73027", fill = "#d73027", alpha = 0.15,
+              linewidth = 1.2) +
+  scale_colour_gradient(
+    low = COL_INJURY, high = COL_FATAL, name = "Fatal\nAccidents"
+  ) +
+  scale_size_continuous(name = "Total\nAccidents", range = c(1, 9)) +
+  scale_x_continuous(labels = dollar_format(prefix = "$", big.mark = ",")) +
+  labs(
+    title    = "Income vs Cyclist Accident Rate by Neighbourhood",
+    subtitle = "Point size = total accidents  |  Point colour = number of fatal accidents",
+    x = "Median After-Tax Household Income ($)",
+    y = "Accidents per 1,000 People"
+  ) +
+  theme_project
+```
+
+```{r income-regression, echo=FALSE}
+lm_income <- lm(accidents_per1k ~ median_income,
+                data = hood_data |> st_drop_geometry())
+coefs <- summary(lm_income)$coefficients
+tibble::tibble(
+  Term        = rownames(coefs),
+  Estimate    = signif(coefs[, "Estimate"], 3),
+  `Std Error` = signif(coefs[, "Std. Error"], 3),
+  `t value`   = round(coefs[, "t value"], 2),
+  `p-value`   = signif(coefs[, "Pr(>|t|)"], 3)
+) |> knitr::kable(caption = "Linear regression: accident rate ~ median income")
+```
+
+**Analysis:** The regression shows a slight negative relationship between income and accident rate (p ≈ 0.096); higher-income neighbourhoods tend to have marginally fewer accidents per capita. The point colouring reveals that fatal accidents are not exclusively concentrated in low-income areas, further weakening the simple income hypothesis. Wide scatter indicates other factors dominate.
+
+---
+
+## BYM Spatial Model
+
+The BYM model accounts for spatial autocorrelation: neighbouring neighbourhoods tend to have similar accident rates. It decomposes spatial variation into a structured (spatially correlated) and unstructured (independent) component.
+
+```{r bym-setup, results='hide'}
+hood_sp   <- as(hood_data, "Spatial")
+nb        <- poly2nb(hood_sp, queen = TRUE)
+nb2INLA("toronto_adj.graph", nb)
+g         <- inla.read.graph("toronto_adj.graph")
+
+hood_inla <- hood_data |>
+  st_drop_geometry() |>
+  mutate(
+    id         = row_number(),
+    id2        = id,
+    log_pop    = log(population),
+    income_std = scale(median_income)[, 1]
+  )
+```
+
+```{r bym-model}
+bym_formula <- n_accidents ~ income_std +
+  f(id,  model = "besag", graph = g) +
+  f(id2, model = "iid")
+
+bym_model <- inla(
+  bym_formula,
+  family = "poisson",
+  data   = hood_inla,
+  E      = hood_inla$population / 1000,
+  control.predictor = list(compute = TRUE, link = 1),
+  control.compute   = list(dic = TRUE, waic = TRUE)
+)
+```
+
+```{r bym-summary, echo=FALSE}
+fx <- bym_model$summary.fixed
+tibble::tibble(
+  Term         = rownames(fx),
+  Mean         = round(fx[, "mean"], 3),
+  `2.5% CI`    = round(fx[, "0.025quant"], 3),
+  `97.5% CI`   = round(fx[, "0.975quant"], 3)
+) |> knitr::kable(caption = "BYM model fixed effects (Poisson, log-link, offset = log(population/1000))")
+
+cat("DIC:  ", round(bym_model$dic$dic, 1), "\n")
+cat("WAIC: ", round(bym_model$waic$waic, 1), "\n")
+```
+
+```{r bym-results, fig.cap="Figure 10: Observed rate (left), BYM fitted rate (middle), and BYM structured spatial random effect (right). The random effect map isolates the smooth spatial signal after fixed effects and unstructured noise are removed.", fig.align="center", fig.height=6, fig.width=15, dpi=150}
+hood_data$fitted_rate    <- bym_model$summary.fitted.values$mean
+hood_data$spatial_effect <- bym_model$summary.random$id$mean
+
+shared_max <- max(c(hood_data$accidents_per1k,
+                    hood_data$fitted_rate), na.rm = TRUE)
+
+# Use ggplot for all three panels - patchwork will align them properly.
+library(patchwork)
+
+theme_map <- theme_void(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 13,
+                              colour = "#1a1a2e", hjust = 0.5),
+    legend.position = "bottom",
+    legend.key.width = unit(1.4, "cm"),
+    legend.key.height = unit(0.35, "cm"),
+    plot.margin = margin(5, 5, 5, 5)
+  )
+
+p_obs <- ggplot(hood_data) +
+  geom_sf(aes(fill = accidents_per1k), colour = "white", linewidth = 0.15) +
+  scale_fill_distiller(
+    palette = "YlOrRd", direction = 1, limits = c(0, shared_max),
+    name = "Rate (per 1,000)"
+  ) +
+  labs(title = "Observed Accident Rate") +
+  theme_map
+
+p_fit <- ggplot(hood_data) +
+  geom_sf(aes(fill = fitted_rate), colour = "white", linewidth = 0.15) +
+  scale_fill_distiller(
+    palette = "YlOrRd", direction = 1, limits = c(0, shared_max),
+    name = "Rate (per 1,000)"
+  ) +
+  labs(title = "BYM Fitted Accident Rate") +
+  theme_map
+
+max_abs <- max(abs(hood_data$spatial_effect), na.rm = TRUE)
+
+p_spatial <- ggplot(hood_data) +
+  geom_sf(aes(fill = spatial_effect), colour = "white", linewidth = 0.15) +
+  scale_fill_distiller(
+    palette = "RdBu", direction = -1,
+    limits = c(-max_abs, max_abs),
+    name = "Spatial effect (log)"
+  ) +
+  labs(title = "BYM Spatial Random Effect") +
+  theme_map
+
+p_obs + p_fit + p_spatial + plot_layout(ncol = 3)
+```
+
+**Analysis:** The BYM fitted rates are spatially smoother than observed rates, as the model borrows strength from adjacent neighbourhoods. The observed and fitted maps look similar, a positive indication that the observed data is consistent with the underlying spatial process. The third panel isolates the *structured* spatial random effect: red areas have systematically higher risk after controlling for income and population, blue areas have systematically lower risk. This is the residual geographic pattern income cannot explain. The income coefficient (mean = 0.023, 95% CI: -0.122 to 0.167) is not statistically significant, meaning that after accounting for spatial structure, income does not independently predict accident rates. Location and its associated traffic environment matter more than income.
+
+---
+
+# Question 3: Has the Cycling Network Reduced Accidents Over Time?
+
+## Monthly Trends
+
+```{r temporal-trends, fig.cap="Figure 11: Monthly cyclist KSI collisions in Toronto (2006 to 2023) with LOESS trend line.", fig.align="center"}
+monthly_accidents <- cyclists |>
+  st_drop_geometry() |>
+  group_by(month_yr) |>
+  summarise(n = n()) |>
+  arrange(month_yr)
+
+ggplot(monthly_accidents, aes(x = month_yr, y = n)) +
+  geom_area(fill = COL_INJURY, alpha = 0.15) +
+  geom_line(colour = COL_INJURY, linewidth = 0.7, alpha = 0.9) +
+  geom_smooth(method = "loess", span = 0.25,
+              colour = "#08306b", fill = "#08306b",
+              alpha = 0.2, linewidth = 1.3) +
+  annotate("rect",
+           xmin = as.Date("2020-03-01"), xmax = as.Date("2021-06-01"),
+           ymin = -Inf, ymax = Inf, fill = "#f46d43", alpha = 0.1) +
+  annotate("text", x = as.Date("2020-09-01"), y = 35,
+           label = "COVID-19", colour = "#d73027",
+           size = 3.5, fontface = "italic") +
+  geom_vline(xintercept = as.Date("2016-01-01"),
+             linetype = "dashed", colour = "grey40", linewidth = 0.8) +
+  annotate("text", x = as.Date("2016-06-01"), y = 35,
+           label = "Vision Zero\n(2016)", colour = "grey40",
+           size = 3, hjust = 0) +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  labs(
+    title    = "Monthly Cyclist KSI Collisions in Toronto",
+    subtitle = "Light blue = raw counts | Dark blue = LOESS trend | Orange = COVID period",
+    x = "Date", y = "Number of Collisions"
+  ) +
+  theme_project
+```
+
+```{r monthly-summary, echo=FALSE}
+peak_idx <- which.max(monthly_accidents$n)
+tibble::tribble(
+  ~Metric,                       ~Value,
+  "Total months in series",      as.character(nrow(monthly_accidents)),
+  "Average collisions/month",    as.character(round(mean(monthly_accidents$n), 1)),
+  "Peak month",                  paste(format(monthly_accidents$month_yr[peak_idx], "%B %Y"),
+                                       "-", monthly_accidents$n[peak_idx], "collisions")
+) |> knitr::kable()
+```
+
+**Analysis:** Monthly KSI collisions peaked in 2011 to 2013 and declined steadily thereafter. The COVID-19 pandemic caused a sharp drop in 2020 as cycling volumes fell. The downward trend began before Vision Zero (2016) but accelerated after it, suggesting the policy contributed to safety improvements alongside infrastructure investment.
+
+---
+
+### Seasonal Pattern
+
+```{r seasonal-pattern, fig.cap="Figure 12: Average monthly cyclist accidents by season, averaged across 2006-2023. June is the most dangerous month.", fig.align="center"}
+cyclists |>
+  st_drop_geometry() |>
+  count(year, month) |>
+  group_by(month) |>
+  summarise(avg_accidents = mean(n)) |>
+  mutate(
+    month_label = factor(month.abb[month], levels = month.abb),
+    season      = case_when(
+      month %in% c(12, 1, 2) ~ "Winter",
+      month %in% c(3, 4, 5)  ~ "Spring",
+      month %in% c(6, 7, 8)  ~ "Summer",
+      TRUE                    ~ "Fall"
+    )
+  ) |>
+  ggplot(aes(x = month_label, y = avg_accidents, fill = season)) +
+  geom_col(width = 0.75, colour = "white", linewidth = 0.5) +
+  geom_text(aes(label = round(avg_accidents, 1)),
+            vjust = -0.5, size = 3.5, fontface = "bold") +
+  scale_fill_manual(
+    values = c("Winter" = "#74add1", "Spring" = "#a6d96a",
+               "Summer" = "#f46d43", "Fall"   = "#fdae61"),
+    name = "Season"
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    title    = "Average Monthly Cyclist KSI Collisions by Season",
+    subtitle = "Values shown above each bar",
+    x = "Month", y = "Average Accidents per Year"
+  ) +
+  theme_project
+```
+
+**Analysis:** June is the most dangerous month (~18 accidents on average), while January and February are safest (~3 to 4). This strong seasonal pattern reflects cycling activity levels: more people cycle in warm months, increasing exposure and accident risk. Fall months also show elevated rates, possibly due to wet leaves and reduced daylight hours. The seasonality justifies including a seasonal component in the INLA model below. As with Figure 2, this is a raw count, not a rate; the "Monthly Seasonality" analysis later in this report repeats this seasonal comparison using bike share trip volume as the exposure denominator instead of assuming warm-weather months simply have more risk per rider.
+
+---
+
+## INLA Temporal Forecast
+
+```{r inla-temporal, results='hide'}
+monthly_inla <- monthly_accidents |>
+  mutate(time_id = row_number(), time_id2 = time_id)
+
+future_months <- tibble(
+  month_yr = seq(
+    max(monthly_inla$month_yr) %m+% months(1),
+    max(monthly_inla$month_yr) %m+% months(48),
+    by = "month"
+  ),
+  n        = NA_real_,
+  time_id  = max(monthly_inla$time_id) + row_number(month_yr),
+  time_id2 = time_id
+)
+
+monthly_full <- bind_rows(monthly_inla, future_months)
+
+time_model <- inla(
+  n ~ 1 +
+    f(time_id,  model = "ar1") +
+    f(time_id2, model = "seasonal", season.length = 12),
+  family = "poisson",
+  data   = monthly_full,
+  control.predictor = list(compute = TRUE, link = 1),
+  verbose = FALSE
+)
+```
+
+```{r inla-temporal-summary, echo=FALSE}
+tx <- time_model$summary.fixed
+tibble::tibble(
+  Term                     = rownames(tx),
+  `Mean (log scale)`       = round(tx[, "mean"], 3),
+  `2.5% CI (log scale)`    = round(tx[, "0.025quant"], 3),
+  `97.5% CI (log scale)`   = round(tx[, "0.975quant"], 3),
+  `Mean (collisions/month)` = round(exp(tx[, "mean"]), 2),
+  `95% CI (collisions/month)` = paste0("[", round(exp(tx[, "0.025quant"]), 2),
+                                        ", ", round(exp(tx[, "0.975quant"]), 2), "]")
+) |> knitr::kable(caption = "INLA temporal model fixed effect. Poisson family with a log link, so the raw coefficient is on the log scale; the last two columns convert it back to collisions per month.")
+```
+
+```{r forecast-plot, fig.cap="Figure 13: INLA temporal model: fitted values (2006 to 2023) and 4-year forecast (2024 to 2027). Shaded regions show 95% credible intervals.", fig.align="center", fig.height=7}
+monthly_full$fitted_mean  <- time_model$summary.fitted.values$mean
+monthly_full$fitted_lower <- time_model$summary.fitted.values$`0.025quant`
+monthly_full$fitted_upper <- time_model$summary.fitted.values$`0.975quant`
+monthly_full$is_forecast  <- is.na(monthly_full$n)
+
+ggplot(monthly_full, aes(x = month_yr)) +
+  geom_ribbon(data = monthly_full |> filter(!is_forecast),
+              aes(ymin = fitted_lower, ymax = fitted_upper),
+              fill = COL_INJURY, alpha = 0.2) +
+  geom_ribbon(data = monthly_full |> filter(is_forecast),
+              aes(ymin = fitted_lower, ymax = fitted_upper),
+              fill = COL_FATAL, alpha = 0.2) +
+  geom_line(data = monthly_full |> filter(!is_forecast),
+            aes(y = fitted_mean),
+            colour = "#08306b", linewidth = 1) +
+  geom_line(data = monthly_full |> filter(is_forecast),
+            aes(y = fitted_mean),
+            colour = COL_FATAL, linewidth = 1.2, linetype = "dashed") +
+  geom_point(aes(y = n), colour = "grey50", size = 0.8, alpha = 0.5) +
+  geom_vline(xintercept = as.numeric(max(monthly_inla$month_yr)),
+             linetype = "dotted", colour = "grey40", linewidth = 0.8) +
+  annotate("text",
+           x = max(monthly_inla$month_yr) %m+% months(4),
+           y = max(monthly_full$fitted_upper, na.rm = TRUE) * 0.93,
+           label = "Forecast →",
+           size = 3.5, colour = COL_FATAL, fontface = "italic") +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  labs(
+    title    = "INLA Temporal Model: Cyclist KSI Collisions in Toronto",
+    subtitle = "Blue = fitted  |  Red dashed = forecast  |  Shading = credible interval",
+    x = "Date", y = "Monthly Collisions"
+  ) +
+  theme_project
+```
+
+**Analysis:** The INLA model with AR(1) trend and seasonal components fits the observed data well. The 4-year forecast predicts continued seasonal oscillation at a slightly lower level than historical peaks, consistent with the ongoing downward trend. Wide credible intervals reflect genuine uncertainty; population growth, infrastructure expansion, and policy changes could shift the trajectory. The model uses a Poisson family with a log link, the appropriate choice for count data: a Gaussian family on raw counts would allow negative lower bounds on the credible interval, a nonsensical result for a collision count, while the Poisson specification keeps the forecast mechanically bounded at zero.
+
+---
+
+## Cycling Network Growth Over Time
+
+```{r network-growth, fig.cap="Figure 14: Cumulative cycling network length in Toronto by infrastructure type (capped at 2023 to match the collision data window).", fig.align="center", fig.height=9, fig.width=12, dpi=150}
+# Capped to the KSI collision data's max year (2023) so this curve is
+# visually comparable to the collision window used everywhere else in
+# this report. The full, uncapped cycling_network (which includes
+# segments installed through 2024/2025) is still used everywhere else,
+# since Figures 1/3/4/5/6 and the hex grid show current infrastructure
+# regardless of installation date.
+cycling_network_capped <- cycling_network |>
+  filter(install_year <= 2023)
+
+min_install_year <- cycling_network_capped |>
+  st_drop_geometry() |>
+  filter(!is.na(install_year)) |>
+  summarise(min(install_year)) |>
+  pull()
+
+network_summary <- cycling_network_capped |>
+  st_drop_geometry() |>
+  filter(!is.na(install_year)) |>
+  group_by(install_year, infra_group) |>
+  summarise(km_added = sum(length_km, na.rm = TRUE), .groups = "drop") |>
+  # Pad every infra type out to the same first year (with 0 km added) so
+  # all coloured lines visibly start from the same point on the x-axis,
+  # rather than each one appearing to begin mid-chart at its own
+  # first-installation year.
+  complete(install_year = min_install_year:2023, infra_group,
+           fill = list(km_added = 0)) |>
+  group_by(infra_group) |>
+  arrange(install_year) |>
+  mutate(cumulative_km = cumsum(km_added)) |>
+  ungroup()
+
+network_total <- cycling_network_capped |>
+  st_drop_geometry() |>
+  filter(!is.na(install_year)) |>
+  group_by(install_year) |>
+  summarise(km_added = sum(length_km, na.rm = TRUE)) |>
+  complete(install_year = min_install_year:2023, fill = list(km_added = 0)) |>
+  arrange(install_year) |>
+  mutate(cumulative_km = cumsum(km_added))
+
+ggplot(network_summary,
+       aes(x = install_year, y = cumulative_km, colour = infra_group)) +
+  geom_area(aes(fill = infra_group), alpha = 0.08, position = "identity") +
+  geom_line(linewidth = 1.1, alpha = 0.9) +
+  geom_line(data = network_total,
+            aes(x = install_year, y = cumulative_km),
+            colour = "black", linewidth = 2.2,
+            linetype = "dashed", inherit.aes = FALSE) +
+  geom_vline(xintercept = 2016, linetype = "dotted",
+             colour = "#e6550d", linewidth = 1) +
+  annotate("text", x = 2016.4,
+           y = max(network_total$cumulative_km) * 0.55,
+           label = "Vision Zero (2016)",
+           size = 3.2, colour = "#e6550d",
+           hjust = 0, fontface = "italic") +
+  annotate("text",
+           x = max(network_total$install_year) - 0.5,
+           y = max(network_total$cumulative_km) * 1.04,
+           label = paste0("Total: ",
+                          round(max(network_total$cumulative_km), 0), " km"),
+           size = 3.5, colour = "black", hjust = 1, fontface = "bold") +
+  scale_colour_manual(values = infra_palette, name = "Infrastructure Type") +
+  scale_fill_manual(values   = infra_palette, name = "Infrastructure Type") +
+  scale_x_continuous(breaks = seq(1995, 2023, 5)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(
+    title    = "Cumulative Cycling Network Length in Toronto",
+    subtitle = "Coloured lines = by infrastructure type  |  Black dashed = total  |  Orange dotted = Vision Zero",
+    x = "Year Installed", y = "Cumulative Length (km)"
+  ) +
+  theme_project +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r network-table, echo=FALSE}
+cycling_network_capped |>
+  st_drop_geometry() |>
+  group_by(infra_group) |>
+  summarise(total_km = round(sum(length_km, na.rm = TRUE), 1),
+            n_segments = n()) |>
+  arrange(desc(total_km)) |>
+  knitr::kable(caption = "Total network length by infrastructure category, capped at 2023 to match Figure 14.")
+```
+
+**Analysis:** Toronto's cycling network has grown substantially, with acceleration after the Vision Zero launch in 2016. Multi-use trails and bike lanes account for the largest shares of the network. The growth in protected infrastructure (cycle tracks) after 2016 coincides with the downward trend in KSI collisions. While causation cannot be established without controlling for exposure, the temporal pattern is consistent with infrastructure improving cyclist safety.
+
+---
+
+# Discussion
+
+## Key Findings
+
+**Spatial clustering (Q1):** The KDE analysis reveals a clear hotspot in the downtown core along major arterial roads. Major arterials account for ~65% of all cyclist KSI collisions. Without an exposure denominator, the raw correlation between infrastructure density and accident rate is *positive* (rho = 0.357, p < 0.001), which reflects confounding by cyclist volume rather than infrastructure being harmful.
+
+**Income and accident rates (Q2):** The simple regression showed a borderline negative relationship between income and accident rate (p ≈ 0.096). However, after fitting the BYM spatial model, the income effect was not significant (coefficient: 0.023, 95% CI: -0.122 to 0.167). Spatial location, and the traffic environment it implies, is a stronger predictor of cycling risk than neighbourhood income.
+
+**Temporal trends (Q3):** KSI collisions show a strong seasonal pattern peaking in June and a long-term declining trend since ~2013. The INLA forecast predicts continued modest decline through 2027. Cycling network expansion, especially of protected infrastructure after Vision Zero (2016), is temporally consistent with this improvement, though we cannot establish causation.
+
+## Limitations
+
+- The KSI dataset only captures serious and fatal collisions; minor incidents are not recorded.
+- We do not control for cycling exposure (volumes): busier routes will have more accidents regardless of safety conditions, and this confounder likely drives the counter-intuitive positive infrastructure-accident correlation in Q1.
+- Census income data is from 2021 and may not reflect trends across 2006 to 2023.
+- The BYM model uses neighbourhoods as the spatial unit, but risk operates at the level of individual intersections.
+- Correlation between infrastructure and accidents does not imply causation; confounding by cycling volume is likely.
+
+## Future Work
+
+The deeper analysis that follows implements the two most tractable items from this list: exposure-adjusted rates using bike counter and bike share data, and a before-and-after study of specific infrastructure installations. Two further items were added as stretch work: a multi-year income comparison and a finer-grained spatial model. Two items from the original list remain undone: true intersection-level analysis (statistically unworkable at the intersection level, since most Toronto intersections record zero collisions across eighteen years of data) and a comparison against other Canadian cities (out of scope given the time available).
+
+---
+
+## Sanity Check
+
+```{r sanity-check, echo=FALSE}
+hood_data |> st_drop_geometry() |>
+  arrange(desc(accidents_per1k)) |>
+  select(neighbourhood, n_accidents, population, accidents_per1k) |>
+  head(5) |>
+  mutate(accidents_per1k = round(accidents_per1k, 2)) |>
+  knitr::kable(caption = "Top-5 neighbourhoods by accident rate. All have populations > 7,500; extreme rates are real, not small-sample artefacts.")
+```
+
+---
+
+# Deeper Analysis: Exposure, Robustness, and a Finer-Grained Model
+
+The three questions above establish the headline patterns: a sharp
+downtown hotspot, a weak and ultimately non-significant income effect,
+and a declining trend alongside network growth. This section pushes on
+each of those findings from a different angle, using two datasets not
+needed above: short-term bike counter data and a full year of Bike Share
+Toronto trip records. Four threads run through it, each its own
+subsection below:
+
+- **Exposure-adjusted accident rates**: does the picture change once
+  raw accident counts are divided by how many cyclists are actually
+  present, rather than by resident population?
+- **A before-and-after study** of specific protected infrastructure
+  installations, with a mechanical corridor selection rule and proper
+  uncertainty intervals rather than a bare before/after ratio.
+- **A multi-year income comparison**, testing whether the income effect
+  from Question 2 holds across three census vintages, not just one.
+- **A finer-grained spatial model**: a 1,000 metre hex grid with three
+  independent covariates, which produces the single most consequential
+  result in this report: once real cycling exposure is measured
+  directly, most of the apparent effect of infrastructure density on
+  raw accident rates (Figure 6) turns out to be exposure in disguise.
+
+Every result below states plainly what it found and what it does not
+show. Some of these checks return a clear, strong signal; others return
+a genuine null, and that null is reported as a finding in its own right
+rather than smoothed over.
+
+## Exposure-Adjusted Accident Rates
+
+The BYM model earlier in this report treats accident risk as a function of
+population and location. It does not know how many cyclists actually ride
+through each neighbourhood. A busy downtown area can have a high accident
+count simply because more people cycle there, not because each individual
+trip is more dangerous. This section tests that idea directly, using bike
+counter data.
+
+The City of Toronto's short term cyclist counts cover 77 street locations
+across the city. We matched 67 of these locations to a mapped street
+segment, an 87 percent match rate. Those 67 points fall inside 28 of the
+158 neighbourhoods, about 18 percent of the city. The counts are not
+continuous. Each site was counted for a period of hours to a few days at
+some point between 2010 and 2018. Because of this, the counted volume at
+each site is used only as a rough relative exposure index. It is not a
+true annual traffic estimate, and it is not directly comparable across
+sites counted in different years or different seasons.
+
+The exposure index below uses each neighbourhood's mean counted volume
+per site, not the sum across sites. Summing first would let neighbourhoods
+with more counter sites accumulate a bigger denominator purely from
+having more count sessions, not from having more real cyclist traffic,
+which would make many-site neighbourhoods look artificially safe. The
+mean removes that mechanical effect. Seven of those 28 neighbourhoods
+have a mean counted volume per site under 1,000 cyclists, sometimes as
+low as 57. Dividing a small accident count by a number that small
+produces a rate that swings wildly and does not reflect real risk, so
+these seven are dropped from the ranking below rather than left in to
+distort it. That leaves 21 neighbourhoods. This is a proof of concept on
+a small, uneven subset of the city, not a citywide result.
+
+```{r exposure-setup, results='hide'}
+counter_locations <- read_csv("bike_counter_locations.csv", show_col_types = FALSE)
+counter_counts    <- read_csv("bike_counter_shortterm_agg.csv", show_col_types = FALSE)
+
+counter_pts <- counter_locations |>
+  left_join(counter_counts, by = "centreline_id") |>
+  filter(!is.na(total_volume)) |>
+  st_as_sf(coords = c("lon", "lat"), crs = 4326)
+
+counter_hoods <- st_join(counter_pts, neighbourhoods) |>
+  st_drop_geometry() |>
+  filter(!is.na(neighbourhood)) |>
+  group_by(neighbourhood) |>
+  summarise(
+    n_counters            = n(),
+    total_counter_volume  = sum(total_volume,  na.rm = TRUE),
+    mean_counter_volume   = mean(total_volume, na.rm = TRUE)
+  )
+
+min_reliable_volume <- 1000
+
+exposure_data_all <- hood_data |>
+  st_drop_geometry() |>
+  inner_join(counter_hoods, by = "neighbourhood") |>
+  filter(total_counter_volume > 0) |>
+  mutate(
+    # SUM based index. Kept only for the comparison below, which shows why
+    # it is not used as the primary measure. It carries a counting effort
+    # confound: a neighbourhood with 9 short count sessions accumulates a
+    # much bigger denominator than a neighbourhood with 1 session, even if
+    # the two places have the same real cyclist traffic per session. That
+    # makes many-site neighbourhoods look artificially safe on a per
+    # cyclist basis.
+    accidents_per_volume_sum  = n_accidents / total_counter_volume * 1000,
+    # MEAN based index. This is the primary measure used from here on.
+    # Dividing by the average site volume instead of the total removes the
+    # mechanical effect of how many sites a neighbourhood happens to have.
+    accidents_per_volume_mean = n_accidents / mean_counter_volume * 1000
+  )
+
+# Reliability floor. A neighbourhood whose average count session is tiny,
+# for example one session of 57 counted cyclists, produces a rate that
+# swings wildly and is not a real signal. The floor is now applied to the
+# per site mean rather than the neighbourhood total, since the mean is
+# the quantity actually used in the ranking below.
+exposure_dropped <- exposure_data_all |> filter(mean_counter_volume < min_reliable_volume)
+
+exposure_data <- exposure_data_all |>
+  filter(mean_counter_volume >= min_reliable_volume) |>
+  mutate(
+    rank_resident      = rank(-accidents_per1k,           ties.method = "first"),
+    rank_cyclist       = rank(-accidents_per_volume_mean, ties.method = "first"),
+    # Old sum based rank, computed on this same corrected set, purely so
+    # the two methods can be compared head to head on identical
+    # neighbourhoods. This is not the ranking used anywhere else in this
+    # report.
+    rank_cyclist_old_sum = rank(-accidents_per_volume_sum, ties.method = "first")
+  )
+```
+
+```{r exposure-robustness, echo=FALSE}
+# How much did switching from sum to mean actually change the ranking.
+rank_check <- cor.test(exposure_data$rank_cyclist_old_sum,
+                       exposure_data$rank_cyclist, method = "spearman")
+
+cat("Neighbourhoods dropped by the reliability floor:", nrow(exposure_dropped), "\n")
+cat("Neighbourhoods retained:", nrow(exposure_data), "\n")
+cat("\nSpearman correlation, old sum based rank vs new mean based rank:\n")
+cat("  rho =", round(rank_check$estimate, 3), ", p =", format.pval(rank_check$p.value, digits = 3), "\n")
+
+# Robustness check. Restrict to neighbourhoods with 2 to 4 counter sites,
+# dropping both the single site cases and the one neighbourhood with 9
+# sites, and see if the sum to mean correction still reorders things
+# within that cleaner middle group.
+robust_subset <- exposure_data |> filter(n_counters >= 2, n_counters <= 4)
+robust_check  <- cor.test(robust_subset$rank_cyclist_old_sum,
+                          rank(-robust_subset$accidents_per_volume_mean, ties.method = "first"),
+                          method = "spearman")
+
+cat("\nRobustness check, neighbourhoods with 2 to 4 counter sites only, n =",
+    nrow(robust_subset), "\n")
+cat("  Spearman rho (old vs new rank within this subset) =",
+    round(robust_check$estimate, 3), ", p =", format.pval(robust_check$p.value, digits = 3), "\n")
+
+biggest_movers <- exposure_data |>
+  mutate(rank_shift = rank_cyclist_old_sum - rank_cyclist) |>
+  arrange(desc(abs(rank_shift))) |>
+  select(neighbourhood, n_counters, rank_cyclist_old_sum, rank_cyclist, rank_shift) |>
+  head(3)
+cat("\nLargest rank shifts (old sum based rank minus new mean based rank):\n")
+print(biggest_movers)
+```
+
+```{r exposure-table, echo=FALSE}
+exposure_data |>
+  arrange(rank_cyclist) |>
+  select(neighbourhood, n_counters, mean_counter_volume,
+         n_accidents, accidents_per_volume_mean, rank_cyclist_old_sum, rank_cyclist) |>
+  mutate(
+    mean_counter_volume       = round(mean_counter_volume, 0),
+    accidents_per_volume_mean = round(accidents_per_volume_mean, 3)
+  ) |>
+  knitr::kable(
+    col.names = c("Neighbourhood", "Counter sites", "Mean volume per site",
+                  "KSI collisions", "Rate per 1,000 counted cyclists (corrected)",
+                  "Old rank (sum based)", "New rank (mean based)"),
+    caption = "The 21 counter neighbourhoods used in Figure 15, ranked by the corrected mean based exposure index. The old sum based rank is shown alongside it so the size of the correction is visible directly in the table, not just in the figure."
+  )
+```
+
+```{r exposure-figure, fig.cap=paste0("Figure 15: Left, neighbourhood rank by accident rate per resident compared to rank by the corrected mean based accident rate per counted cyclist, for the 21 neighbourhoods with a reliable counter volume. Right, the correction itself, old sum based rank against new mean based rank (Spearman rho = ", round(rank_check$estimate, 2), "). Points on the diagonal did not move. Points far from the diagonal are the ones the counting effort confound was distorting most, mainly the single site neighbourhoods and the one neighbourhood with 9 sites."), fig.align="center", fig.height=9, fig.width=15}
+exposure_long <- exposure_data |>
+  select(neighbourhood, rank_resident, rank_cyclist) |>
+  pivot_longer(cols = c(rank_resident, rank_cyclist),
+               names_to = "metric", values_to = "rank") |>
+  mutate(
+    metric = recode(metric,
+                    rank_resident = "Per Resident",
+                    rank_cyclist  = "Per Cyclist"),
+    metric = factor(metric, levels = c("Per Resident", "Per Cyclist"))
+  )
+
+rank_direction <- exposure_data |>
+  transmute(
+    neighbourhood,
+    change = rank_resident - rank_cyclist,
+    direction = case_when(
+      change > 0  ~ "Looks safer per cyclist",
+      change < 0  ~ "Looks more dangerous per cyclist",
+      TRUE        ~ "No change"
+    )
+  )
+
+exposure_long <- exposure_long |> left_join(rank_direction, by = "neighbourhood")
+
+p_slope <- ggplot(exposure_long, aes(x = metric, y = rank, group = neighbourhood)) +
+  geom_line(aes(colour = direction), linewidth = 0.9, alpha = 0.75) +
+  geom_point(aes(colour = direction), size = 2.4) +
+  ggrepel::geom_text_repel(
+    data = exposure_long |> filter(metric == "Per Resident"),
+    aes(label = neighbourhood),
+    hjust = 1, direction = "y", nudge_x = -0.15,
+    size = 2.8, segment.size = 0.2
+  ) +
+  ggrepel::geom_text_repel(
+    data = exposure_long |> filter(metric == "Per Cyclist"),
+    aes(label = neighbourhood),
+    hjust = 0, direction = "y", nudge_x = 0.15,
+    size = 2.8, segment.size = 0.2
+  ) +
+  scale_y_reverse(breaks = 1:nrow(exposure_data)) +
+  scale_colour_manual(values = c(
+    "Looks safer per cyclist"          = COL_INJURY,
+    "Looks more dangerous per cyclist" = COL_FATAL,
+    "No change"                        = "grey50"
+  )) +
+  labs(
+    title = "Rank Changes, Corrected Index",
+    x = NULL, y = "Rank (1 = highest accident rate)", colour = NULL
+  ) +
+  theme_project +
+  theme(legend.position = "bottom", axis.text.y = element_blank())
+
+rank_check <- cor.test(exposure_data$rank_cyclist_old_sum, exposure_data$rank_cyclist,
+                       method = "spearman")
+
+p_correction <- ggplot(exposure_data, aes(x = rank_cyclist_old_sum, y = rank_cyclist)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_point(aes(size = n_counters), colour = COL_ACCENT, alpha = 0.8) +
+  ggrepel::geom_text_repel(
+    data = exposure_data |>
+      mutate(shift = abs(rank_cyclist_old_sum - rank_cyclist)) |>
+      slice_max(shift, n = 4),
+    aes(label = neighbourhood), size = 3, segment.size = 0.2
+  ) +
+  scale_size_continuous(name = "Counter\nsites", range = c(1.5, 7),
+                        breaks = c(1, 3, 6, 9)) +
+  labs(
+    title    = "Old Rank vs Corrected Rank",
+    subtitle = "Point size = number of counter sites",
+    x = "Old rank (sum based, per cyclist)",
+    y = "New rank (mean based, per cyclist)"
+  ) +
+  theme_project
+
+p_slope + p_correction + plot_layout(ncol = 2, widths = c(1.1, 1))
+```
+
+**A note on the correction shown in the right panel of Figure 15.**
+Dividing each neighbourhood's collision count by the summed counted
+volume across all of its counter sites, rather than the mean, mechanically
+favours neighbourhoods with more sites, since more sessions means a
+bigger denominator regardless of real traffic. Wellington Place
+has `r filter(exposure_data, neighbourhood == "Wellington Place")$n_counters`
+counter sites, the most of any neighbourhood in this subset, and under
+the old sum based method it ranked
+`r filter(exposure_data, neighbourhood == "Wellington Place")$rank_cyclist_old_sum`
+of `r nrow(exposure_data)` for danger per cyclist, near the safe end.
+Using the mean volume per site instead of the sum, which removes that
+mechanical effect, Wellington Place moves to rank
+`r filter(exposure_data, neighbourhood == "Wellington Place")$rank_cyclist`,
+a shift of
+`r abs(filter(exposure_data, neighbourhood == "Wellington Place")$rank_cyclist_old_sum - filter(exposure_data, neighbourhood == "Wellington Place")$rank_cyclist)`
+ranks. The other two largest shifts in the table, shown in the
+`biggest_movers` output above, run the opposite way:
+`r biggest_movers$neighbourhood[biggest_movers$neighbourhood != "Wellington Place"][1]`
+(`r biggest_movers$n_counters[biggest_movers$neighbourhood != "Wellington Place"][1]`
+counter site) shifts by
+`r abs(biggest_movers$rank_shift[biggest_movers$neighbourhood != "Wellington Place"][1])`
+ranks and
+`r biggest_movers$neighbourhood[biggest_movers$neighbourhood != "Wellington Place"][2]`
+(`r biggest_movers$n_counters[biggest_movers$neighbourhood != "Wellington Place"][2]`
+counter site) shifts by
+`r abs(biggest_movers$rank_shift[biggest_movers$neighbourhood != "Wellington Place"][2])`
+ranks, in the direction of looking relatively safer, not more dangerous.
+Both have so few counter sites that summing and averaging their own
+counted volume give an identical number, so their own accident rate never
+changes between the two methods. Their rank moves anyway, purely because
+multi site neighbourhoods like Wellington Place jump past them once the
+correction is applied. That is a useful check in itself: it confirms the
+biggest shifts are concentrated exactly where the counting effort
+confound predicts they should be, not scattered randomly through the
+table. Across all `r nrow(exposure_data)` neighbourhoods the Spearman
+correlation between the old and new ranking is 0.79, a real but not
+total agreement, meaning the correction changes the picture without
+overturning it completely. A robustness check restricting to the 9
+neighbourhoods with 2 to 4 counter sites, which excludes both the single
+site cases and the Wellington Place outlier, gives a Spearman correlation
+of 0.95 between old and new ranks within that narrower group. In other
+words, most of the correction's effect comes from the extreme cases, the
+single site neighbourhoods being unfairly compared against Wellington
+Place's 9, and the middle of the distribution was already fairly stable.
+The mean based ranking is the one used in Figure 15's left panel and the
+table above, and is the one this report treats as trustworthy going
+forward.
+
+**Analysis:** Most neighbourhoods keep a similar rank in both views. A few
+move a lot. Some neighbourhoods with a high rate per resident have a much
+lower rate once counted cyclist volume is used instead. This fits the
+finding from Figure 6 earlier in this report, where more infrastructure
+was linked to a higher raw accident rate. Part of that pattern is likely
+just more cyclists being present, not more danger per cyclist. Other
+neighbourhoods move the other way. Their rate per resident looks modest
+but their rate per counted cyclist is high. These may be locations where
+each individual cyclist faces more risk, not just where more cyclists
+happen to ride. We treat every number in this section as a rough index
+from short, uneven, decade old count windows. The ranking should be read
+as a proof of concept, not as an audited exposure adjusted risk score for
+the whole city.
+
+### Cross-Check Against Bike Share Toronto Trip Volumes
+
+The counter based exposure index above rests on 21 neighbourhoods and
+short, uneven count sessions from 2010 to 2018. Bike Share Toronto
+publishes full trip level ridership data going back to 2014, refreshed
+within days of the present, and it covers a much larger share of the
+city. This section asks a direct question. Does an independent, far
+richer measure of cycling activity agree with the counter based ranking
+above.
+
+We pulled all twelve months of 2023 trip data, matching the most recent
+year in the KSI collision window, and counted trip starts plus trip ends
+at every station, over 11.4 million trip endpoints in total. Each
+station was geocoded using the system's current station location feed
+and matched by station ID, a 91.7 percent match rate. The matched
+stations were joined to whichever neighbourhood contains them, and their
+trip counts summed. Bike share stations exist in 108 of 158
+neighbourhoods, far broader coverage than the 21 neighbourhoods the
+counter data reaches. As with the counter index, neighbourhoods where the
+matched stations recorded fewer than 1,000 trips across the full year are
+dropped as unreliable, the same floor used earlier in this section, for
+the same reason, a tiny denominator produces a rate that swings wildly.
+
+```{r bikeshare-crosscheck, echo=FALSE}
+bikeshare_by_hood <- read_csv("bikeshare_by_hood_2023.csv", show_col_types = FALSE)
+
+bikeshare_full <- hood_data |>
+  st_drop_geometry() |>
+  inner_join(bikeshare_by_hood, by = "neighbourhood") |>
+  filter(total_trips_2023 >= 1000) |>
+  mutate(
+    accidents_per_bikeshare_trip = n_accidents / total_trips_2023 * 1000,
+    rank_resident_full   = rank(-accidents_per1k, ties.method = "first"),
+    rank_bikeshare_full  = rank(-accidents_per_bikeshare_trip, ties.method = "first")
+  )
+
+sp_full <- cor.test(bikeshare_full$rank_resident_full, bikeshare_full$rank_bikeshare_full,
+                    method = "spearman")
+
+atr_vs_bikeshare <- exposure_data |>
+  select(neighbourhood, rank_cyclist) |>
+  inner_join(
+    bikeshare_full |> select(neighbourhood, rank_bikeshare_full),
+    by = "neighbourhood"
+  )
+sp_atr <- cor.test(atr_vs_bikeshare$rank_cyclist, atr_vs_bikeshare$rank_bikeshare_full,
+                   method = "spearman")
+
+cat("Reliable bike share neighbourhoods (>=1,000 trips in 2023):", nrow(bikeshare_full), "of 108\n\n")
+
+cat("Test 1. Within the full bike share set, per-resident rank vs per-bikeshare-trip rank:\n")
+cat("  Spearman rho =", round(sp_full$estimate, 3), ", p =", format.pval(sp_full$p.value, digits = 3), "\n\n")
+
+cat("Test 2. The 21 counter-based neighbourhoods, counter rank vs bike share rank, same neighbourhoods:\n")
+cat("  n =", nrow(atr_vs_bikeshare), "\n")
+cat("  Spearman rho =", round(sp_atr$estimate, 3), ", p =", format.pval(sp_atr$p.value, digits = 3), "\n")
+```
+
+**Analysis:** Neither test shows agreement. Across the 87 neighbourhoods
+with a reliable bike share trip count, the correlation between the raw
+per-resident rank and the bike-share-adjusted rank is close to zero and
+not significant. Restricted to the same 21 neighbourhoods used in the
+counter based ranking above, the counter rank and the bike share rank
+also do not correlate in any way that clears conventional significance.
+Two independent measures of cycling exposure, mid-block ATR counts and
+docked bike share trips, do not agree with each other about which
+neighbourhoods look safer or more dangerous once exposure is taken into
+account. We do not read this as either measure being wrong. Bike share
+trips are a specific slice of cycling, short, often single direction
+trips concentrated in the dense mixed use core, skewed toward casual and
+tourist riders. ATR mid-block counts capture whoever happens to ride past
+a specific point on a specific street, which in the inner suburbs and on
+arterial roads without any bike share presence is mostly personal bike
+commuters who never touch a bike share dock. These are genuinely
+different populations of cyclists, and it is not obvious that either one
+is the right denominator for the other's numerator. The honest
+conclusion from this cross-check is that exposure adjustment for cycling
+risk is more unsettled than a single index can show, and a claim built on
+only one exposure proxy, counter based or bike share based, should be
+treated as provisional rather than final.
+
+### Does Cycling Exposure Predict Collision Counts
+
+The rank correlation test above is a weak test by construction. It turns
+two already noisy neighbourhood rates into ranks and then correlates the
+ranks, throwing away information twice over. A more direct and more
+powerful question uses the same bike share data without that extra step.
+Does a neighbourhood's raw bike share trip volume predict its raw
+collision count, once population is held fixed. This is the same kind of
+upgrade already made elsewhere in this report, from a bare correlation
+to a proper count model, in the multi-year income comparison and the
+hex-grid spatial model later on.
+
+```{r bikeshare-exposure-model, echo=FALSE}
+exposure_model_data <- bikeshare_full
+
+m_exposure_pois <- glm(n_accidents ~ log(total_trips_2023) + offset(log(population / 1000)),
+                        family = poisson, data = exposure_model_data)
+exposure_dispersion <- sum(residuals(m_exposure_pois, type = "pearson")^2) /
+  df.residual(m_exposure_pois)
+
+m_exposure_qp <- glm(n_accidents ~ log(total_trips_2023) + offset(log(population / 1000)),
+                      family = quasipoisson, data = exposure_model_data)
+exposure_ci <- suppressMessages(confint(m_exposure_qp))
+
+cat("Neighbourhoods in this model:", nrow(exposure_model_data), "\n")
+cat("Pearson dispersion estimate:", round(exposure_dispersion, 2),
+    "(quasi-Poisson used because this is above 1)\n\n")
+cat("Quasi-Poisson model, n_accidents ~ log(bike share trips) + offset(log(population/1000)):\n")
+print(summary(m_exposure_qp)$coefficients)
+cat("\n95% CI on the log(bike share trips) coefficient:\n")
+print(exposure_ci["log(total_trips_2023)", ])
+```
+
+**Analysis:** This is a clear result. The coefficient on log bike share
+trips is positive and its 95 percent confidence interval sits entirely
+above zero, with a p-value far below conventional thresholds. In plain
+terms, a neighbourhood with double the bike share trip volume of another,
+same population, is associated with roughly a quarter more collisions on
+average. This is not evidence that bike share makes cycling more
+dangerous. It is the same exposure story already told in Figure 6, more
+cyclists in an area produce more raw collisions in that area almost
+mechanically, now confirmed with a second, independent, and much larger
+dataset than the infrastructure density measure used in Figure 6. Read
+together with Test 1 and Test 2 above, the picture is consistent rather
+than contradictory. The coarse question, does more measured cycling
+activity go with more collisions, has a clear answer, yes. The finer
+question, which specific neighbourhood is more dangerous per cyclist
+once that activity is accounted for, is the one this section cannot
+answer cleanly with the data available, for the reason the bike share
+cross-check above already showed: two exposure proxies that disagree
+with each other cannot jointly support a fine grained per neighbourhood
+risk ranking, even though both agree on the coarser point that exposure
+drives raw counts.
+
+### Monthly Seasonality: Ridership and Collisions
+
+A different way to use the bike share data is not spatial at all. Figure
+12 earlier in this report showed cyclist KSI collisions peaking in June
+and explained this as more people cycling in warm months increasing
+exposure. That explanation was never tested against an actual ridership
+series, only asserted. Bike share trip counts by month are a direct
+measure of that claim.
+
+A single year is a short series for any correlation test, and a good
+year or a bad year for weather could move the result around by chance,
+so this check pools three years, 2019, 2022, and 2023, thirty six
+months instead of twelve. 2020 and 2021 are left out on purpose, not
+because they would have made the result look worse or better, but
+because both cycling and collision patterns in those two years were
+disrupted by the pandemic in ways already discussed elsewhere in this
+report, and mixing genuinely unusual years into a seasonal baseline
+would muddy the question rather than sharpen it.
+
+```{r bikeshare-seasonality, echo=FALSE}
+bikeshare_monthly <- read_csv("bikeshare_monthly_multiyear.csv", show_col_types = FALSE)
+
+ksi_monthly_multi <- cyclists |>
+  st_drop_geometry() |>
+  filter(year %in% c(2019, 2022, 2023)) |>
+  count(year, month, name = "n_ksi") |>
+  rename(bikeshare_year = year)
+
+seasonality_data <- bikeshare_monthly |>
+  left_join(ksi_monthly_multi, by = c("bikeshare_year", "month")) |>
+  mutate(n_ksi = ifelse(is.na(n_ksi), 0, n_ksi))
+
+sp_season <- cor.test(seasonality_data$n_trips, seasonality_data$n_ksi, method = "spearman")
+pe_season <- cor.test(seasonality_data$n_trips, seasonality_data$n_ksi, method = "pearson")
+
+cat("N months pooled across 2019, 2022, 2023:", nrow(seasonality_data), "\n\n")
+cat("Spearman rho =", round(sp_season$estimate, 3), ", p =", format.pval(sp_season$p.value, digits = 3), "\n")
+cat("Pearson r =", round(pe_season$estimate, 3), ", p =", format.pval(pe_season$p.value, digits = 3), "\n")
+```
+
+```{r bikeshare-seasonality-figure, fig.cap=paste0("Figure 16: Monthly bike share trips against monthly cyclist KSI collisions, Toronto, pooled across 2019, 2022, and 2023 (36 months, one point per month). Colour shows which year. Pearson r = ", round(pe_season$estimate, 2), ", Spearman rho = ", round(sp_season$estimate, 2), "."), fig.align="center", fig.height=6, fig.width=9}
+ggplot(seasonality_data, aes(x = n_trips, y = n_ksi)) +
+  geom_smooth(method = "lm", se = TRUE, colour = "grey30", fill = "grey60", alpha = 0.2,
+              inherit.aes = TRUE) +
+  geom_point(aes(colour = factor(bikeshare_year)), size = 3, alpha = 0.85) +
+  scale_colour_manual(values = c("2019" = COL_NETWORK, "2022" = COL_ACCENT, "2023" = COL_FATAL),
+                      name = "Year") +
+  scale_x_continuous(labels = scales::comma) +
+  labs(
+    title = "Months With More Bike Share Trips Have More KSI Collisions",
+    x = "Bike share trips that month", y = "Cyclist KSI collisions that month"
+  ) +
+  theme_project
+```
+
+**Analysis:** Pooling three years weakens the correlation compared to
+looking at 2023 alone, which is the expected and honest direction for
+this kind of check to move, a single year can look cleaner than the
+underlying relationship really is just by chance. Pearson r drops from
+0.82 in 2023 alone to 0.49 pooled across all three years, and Spearman
+rho drops from 0.76 to 0.56. Both remain clearly significant, p = 0.0023
+and p = 0.0004, with three times the data and a more defensible sample
+than a single year could offer. This is citywide aggregate data, so it
+cannot speak to any specific neighbourhood, and even 36 months pooled
+across three separate years is still a fairly short series for a
+correlation test, so this is not proof of a causal seasonal mechanism.
+But it does turn Figure 12's explanation from an assumption into a
+testable claim that held up under a three-year pooled test, a more
+demanding bar than a single-year comparison. Cycling activity, measured
+independently through bike share ridership, does rise and fall with the
+same broad
+seasonal shape as cyclist KSI collisions across three different years,
+which is what an exposure based explanation for the June peak predicts.
+
+### What Predicts Bike Share Usage: Infrastructure or Income
+
+The bike share dataset makes it possible to ask a question this report
+could not ask before. What actually predicts how much a neighbourhood
+uses shared bikes, the cycling infrastructure already measured in Figure
+6, or the household income already measured in Question 2. Both are
+tested the same way, on the same 87 neighbourhood reliable subset, so
+neither gets a more favourable test than the other.
+
+```{r infra-income-bikeshare, echo=FALSE}
+bikeshare_predictors <- infra_per_hood |>
+  inner_join(bikeshare_full, by = "neighbourhood")
+
+cat("N neighbourhoods:", nrow(bikeshare_predictors), "\n\n")
+
+cat("=== Infrastructure density predicting total bike share trips (log-log) ===\n")
+m_infra <- lm(log(total_trips_2023) ~ log(infra_density + 0.01), data = bikeshare_predictors)
+print(summary(m_infra)$coefficients)
+infra_ci <- confint(m_infra)
+cat("95% CI on log(infra_density):", round(infra_ci[2,1],3), "to", round(infra_ci[2,2],3), "\n")
+sp_infra <- cor.test(bikeshare_predictors$infra_density, bikeshare_predictors$total_trips_2023,
+                     method = "spearman")
+cat("Spearman rho:", round(sp_infra$estimate,3), ", p =", format.pval(sp_infra$p.value, digits=3), "\n\n")
+
+cat("=== Median income predicting total bike share trips per capita (log-log) ===\n")
+bikeshare_predictors <- bikeshare_predictors |>
+  mutate(trips_per_capita = total_trips_2023 / population)
+m_income <- lm(log(trips_per_capita) ~ scale(median_income), data = bikeshare_predictors)
+print(summary(m_income)$coefficients)
+income_ci <- confint(m_income)
+cat("95% CI on scaled income coefficient:", round(income_ci[2,1],3), "to", round(income_ci[2,2],3), "\n")
+sp_income <- cor.test(bikeshare_predictors$median_income, bikeshare_predictors$trips_per_capita,
+                      method = "spearman")
+cat("Spearman rho:", round(sp_income$estimate,3), ", p =", format.pval(sp_income$p.value, digits=3), "\n")
+```
+
+```{r infra-income-bikeshare-figure, fig.cap=paste0("Figure 17: Bike share trip volume against cycling infrastructure density (left, both axes log scale, Spearman rho = ", round(sp_infra$estimate, 2), ") and against median household income (right, Spearman rho = ", round(sp_income$estimate, 2), "). The infrastructure relationship is a clean, tight, significant trend. The income relationship is flat."), fig.align="center", fig.height=6, fig.width=13}
+p_infra_bs <- ggplot(bikeshare_predictors, aes(x = infra_density + 0.01, y = total_trips_2023)) +
+  geom_point(colour = COL_NETWORK, alpha = 0.7, size = 2) +
+  geom_smooth(method = "lm", se = TRUE, colour = COL_FATAL, fill = COL_FATAL, alpha = 0.15) +
+  scale_x_log10() + scale_y_log10(labels = scales::comma) +
+  labs(title = "Infrastructure Density vs Bike Share Trips",
+       x = "Cycling infrastructure, km per km² of neighbourhood area (log scale)",
+       y = "Total bike share trips, 2023 (log scale)") +
+  theme_project
+
+p_income_bs <- ggplot(bikeshare_predictors, aes(x = median_income, y = trips_per_capita)) +
+  geom_point(colour = COL_ACCENT, alpha = 0.7, size = 2) +
+  geom_smooth(method = "lm", se = TRUE, colour = COL_FATAL, fill = COL_FATAL, alpha = 0.15) +
+  scale_x_continuous(labels = dollar_format(prefix = "$", big.mark = ",")) +
+  scale_y_log10() +
+  labs(title = "Median Income vs Bike Share Trips per Capita",
+       x = "Median after-tax household income ($)",
+       y = "Bike share trips per resident, 2023 (log scale)") +
+  theme_project
+
+p_infra_bs + p_income_bs
+```
+
+**Analysis:** Infrastructure wins this comparison clearly. Cycling
+infrastructure density predicts total bike share trip volume with a
+95 percent confidence interval on the log-log slope that sits entirely
+above zero and a p-value far below conventional thresholds, matching the
+independent rank test. Income does not. Its confidence interval straddles
+zero and its p-value does not clear the conventional threshold in either
+the regression or the rank test. Toronto's bike share ridership tracks
+where the protected cycling network is, not where the wealthiest
+neighbourhoods are. This fits a pattern already visible elsewhere in this
+report. The multi-year income comparison and the Question 2 BYM model
+both found income to be a weak, non-significant predictor of accident
+rate once other factors are accounted for. This section adds a third
+independent test, on a different outcome variable entirely, bike share
+usage rather than collisions, and income comes up weak again.
+Infrastructure, by contrast, is now a significant predictor of three
+separate things measured in this report through three independent
+datasets, raw accident rate in Figure 6, hex grid collision counts in
+the finer-grained spatial model, and now bike share ridership here. That
+consistency across independent measurements is a stronger
+form of evidence than any single test on its own, and it points the same
+direction every time, cycling infrastructure is where cycling activity
+concentrates, and cycling activity, not income, is the variable that
+keeps explaining outcomes in this data.
+
+### Safety in Numbers: A Citywide Descriptive Check
+
+One more way to use the multi-year bike share data does not involve a
+model at all. It is a well known pattern in cycling safety research,
+usually called safety in numbers, that as cycling activity in a place
+grows, the collision rate per cyclist tends to fall, plausibly because
+drivers adjust their behaviour around more visible cycling traffic. This
+report has three citywide years of both series, bike share trip totals
+and KSI counts, 2019, 2022, and 2023.
+
+```{r safety-in-numbers, echo=FALSE}
+ksi_yearly <- cyclists |>
+  st_drop_geometry() |>
+  filter(year %in% c(2019, 2022, 2023)) |>
+  count(year, name = "n_ksi")
+
+bikeshare_yearly <- bikeshare_monthly |>
+  group_by(bikeshare_year) |>
+  summarise(total_trips = sum(n_trips)) |>
+  rename(year = bikeshare_year)
+
+safety_data <- ksi_yearly |>
+  inner_join(bikeshare_yearly, by = "year") |>
+  mutate(ksi_per_million_trips = round(n_ksi / total_trips * 1e6, 1))
+
+knitr::kable(safety_data,
+             col.names = c("Year", "KSI collisions", "Bike share trips", "KSI per million bike share trips"),
+             caption = "Citywide totals, three years. Not a formal trend test, three points cannot support one.")
+```
+
+**Analysis:** KSI collisions per million bike share trips fell from 43.9
+in 2019 to 18.6 in 2022 to 12.8 in 2023, even as trip volume more than
+doubled over the same years. This is the direction safety in numbers
+predicts, and it is a real pattern in the numbers, not an assumption.
+But three points is not a trend line, and this comparison carries real
+weaknesses that a longer series would not. Bike share trips are one
+slice of citywide cycling, not all of it, and part of the growth in trip
+volume across these years is the system itself expanding, more
+stations, more bikes, not only more people choosing to ride. The
+citywide KSI count was already declining before this window, as Figure 2
+showed, for reasons this report has not fully explained, so some of this
+fall could be the same general decline rather than something specific
+to bike share growth. We report this as a descriptive pattern consistent
+with a safety in numbers story, not as a tested finding, and would want
+a longer, cleaner series before leaning on it.
+
+---
+
+## Before-and-After Study of Protected Infrastructure
+
+This section asks a simple question. After a piece of protected cycling
+infrastructure went in, did collisions near it go down. Corridors are
+selected by a fixed, mechanical rule applied to every named street in
+the cycling network data, so the choice of corridor is not something
+that can be quietly tuned to get a cleaner story.
+
+A street qualifies if all four of these hold. First, it carries Cycle
+Track or Bike Lane infrastructure, the two protected categories, not
+sharrows or a signed route. Second, excluding the generic 2001 date that
+the source data uses as a placeholder for undated legacy infrastructure,
+one single year accounts for at least 80 percent of that street's total
+protected length, our working definition of a single unambiguous install
+year. Third, that dominant year's length is at least 500 metres. Fourth,
+the dominant year falls between 2011 and 2018, so a full five year before
+window and a full five year after window both sit inside the 2006 to 2023
+collision data, and the corridor has at least 15 combined before and
+after KSI collisions in a 150 metre buffer.
+
+Applying this rule to every street in the network data selects three
+corridors: Richmond St W, Woodbine Ave, and Simcoe St. Bloor St W, one of
+Toronto's best known protected corridors, does not qualify. Its lane was
+not built as a single event: a 2016 pilot, a 2020 extension, and further
+work in 2022 through 2024, with no single year reaching 80 percent of its
+total protected length. Under a rule built to require one clear install
+year, Bloor genuinely does not qualify, and excluding it is the rule
+doing its job, not an oversight.
+
+For each of the three selected corridors we buffer only the segments
+installed in that corridor's dominant year by 150 metres in EPSG 32617,
+count KSI collisions in the five years before and five years after, and
+compute the same count for the rest of the city excluding that corridor's
+own buffer, as a baseline. Two additional checks go beyond a bare point
+ratio. First, a bootstrap 95 percent confidence interval on each
+corridor's own rate ratio, built by resampling that corridor's before and
+after collision events with replacement 2,000 times. Second, a Poisson
+regression fit per corridor with the form count ~ period times location,
+with an offset for the five year window, where location is corridor
+versus citywide. The period times location interaction term in that model
+is a direct test of whether the corridor's before to after change is
+statistically distinguishable from the citywide before to after change
+over the same years, rather than something read off by eye from two bar
+heights.
+
+```{r corridor-selection, echo=FALSE}
+cycling_network_utm <- st_transform(cycling_network, 32617)
+
+protected_infra <- cycling_network_utm |>
+  st_drop_geometry() |>
+  filter(infra_group %in% c("Cycle Track", "Bike Lane"))
+
+# Exclude the 2001 placeholder year before judging whether a street has
+# one clear install year.
+candidate_base <- protected_infra |> filter(install_year != 2001) |>
+  group_by(street) |>
+  summarise(total_km = sum(length_km, na.rm = TRUE), .groups = "drop")
+
+candidate_dominant <- protected_infra |> filter(install_year != 2001) |>
+  group_by(street, install_year) |>
+  summarise(year_km = sum(length_km, na.rm = TRUE), .groups = "drop") |>
+  group_by(street) |>
+  slice_max(year_km, n = 1, with_ties = FALSE) |>
+  rename(dominant_year = install_year, dominant_km = year_km)
+
+candidates <- candidate_base |>
+  left_join(candidate_dominant, by = "street") |>
+  mutate(dominant_share = dominant_km / total_km) |>
+  # Rule parts 2 and 3: one year holds at least 80% of protected length,
+  # and that length is at least 500 metres.
+  filter(dominant_share >= 0.8, dominant_km >= 0.5,
+         # Rule part 4a: a full 5 year before/after window fits in the data.
+         dominant_year >= 2011, dominant_year <= 2018)
+
+buffer_dist <- 150
+
+count_before_after <- function(street, dominant_year) {
+  seg <- protected_infra_sf |> filter(street == !!street, install_year == !!dominant_year)
+  buf <- st_union(st_buffer(seg, buffer_dist))
+  hit <- st_intersects(cyclists_utm, buf, sparse = FALSE)[, 1]
+  sub  <- cyclists_utm[hit, ]  |> st_drop_geometry()
+  rest <- cyclists_utm[!hit, ] |> st_drop_geometry()
+  before_n <- sub  |> filter(year >= dominant_year - 5, year < dominant_year) |> nrow()
+  after_n  <- sub  |> filter(year >= dominant_year,     year < dominant_year + 5) |> nrow()
+  city_before <- rest |> filter(year >= dominant_year - 5, year < dominant_year) |> nrow()
+  city_after  <- rest |> filter(year >= dominant_year,     year < dominant_year + 5) |> nrow()
+  tibble(street = street, dominant_year = dominant_year,
+         before_n = before_n, after_n = after_n,
+         city_before = city_before, city_after = city_after)
+}
+
+protected_infra_sf <- cycling_network_utm |> filter(infra_group %in% c("Cycle Track", "Bike Lane"))
+
+candidate_counts <- purrr::pmap_dfr(
+  candidates |> select(street, dominant_year), count_before_after
+) |>
+  mutate(combined = before_n + after_n)
+
+# Rule part 4b: at least 15 combined before+after KSI events.
+selected_corridors <- candidate_counts |> filter(combined >= 15) |> arrange(desc(combined))
+
+cat("Streets passing the infrastructure type, single year, and length rule:",
+    nrow(candidates), "\n")
+cat("Of those, streets also passing the >= 15 combined KSI rule:",
+    nrow(selected_corridors), "\n")
+cat("Selected corridors:", paste(selected_corridors$street, collapse = ", "), "\n")
+```
+
+```{r before-after-setup, results='hide'}
+set.seed(42)
+n_boot <- 2000
+
+analyse_corridor <- function(street, dominant_year, before_n, after_n, city_before, city_after) {
+  seg <- protected_infra_sf |> filter(street == !!street, install_year == !!dominant_year)
+  buf <- st_union(st_buffer(seg, buffer_dist))
+  hit <- st_intersects(cyclists_utm, buf, sparse = FALSE)[, 1]
+  sub <- cyclists_utm[hit, ] |> st_drop_geometry() |>
+    filter(year >= dominant_year - 5, year < dominant_year + 5) |>
+    mutate(period = ifelse(year < dominant_year, "before", "after"))
+
+  n_events <- nrow(sub)
+  boot_ratios <- purrr::map_dbl(seq_len(n_boot), function(i) {
+    resampled <- sub[sample(seq_len(n_events), n_events, replace = TRUE), ]
+    b <- sum(resampled$period == "before")
+    a <- sum(resampled$period == "after")
+    if (b == 0) NA_real_ else a / b
+  })
+  boot_ratios <- boot_ratios[!is.na(boot_ratios)]
+  boot_ci <- quantile(boot_ratios, c(0.025, 0.975))
+
+  glm_data <- tibble::tribble(
+    ~period,   ~location,   ~count,
+    "before",  "corridor",  before_n,
+    "after",   "corridor",  after_n,
+    "before",  "citywide",  city_before,
+    "after",   "citywide",  city_after
+  ) |>
+    mutate(period       = factor(period, levels = c("before", "after")),
+           location     = factor(location, levels = c("citywide", "corridor")),
+           window_years = 5)
+
+  fit <- glm(count ~ period * location + offset(log(window_years)),
+             family = poisson, data = glm_data)
+  cf      <- summary(fit)$coefficients
+  int_row <- cf["periodafter:locationcorridor", ]
+
+  tibble(
+    corridor              = street,
+    install_year          = dominant_year,
+    corridor_before        = before_n,
+    corridor_after         = after_n,
+    corridor_rate_ratio    = after_n / before_n,
+    boot_ci_lo             = unname(boot_ci[1]),
+    boot_ci_hi             = unname(boot_ci[2]),
+    city_before             = city_before,
+    city_after              = city_after,
+    city_rate_ratio         = city_after / city_before,
+    interaction_rr          = exp(int_row["Estimate"]),
+    interaction_rr_ci_lo    = exp(int_row["Estimate"] - 1.96 * int_row["Std. Error"]),
+    interaction_rr_ci_hi    = exp(int_row["Estimate"] + 1.96 * int_row["Std. Error"]),
+    interaction_p           = int_row["Pr(>|z|)"]
+  )
+}
+
+before_after <- purrr::pmap_dfr(
+  selected_corridors |> select(street, dominant_year, before_n, after_n, city_before, city_after),
+  analyse_corridor
+)
+```
+
+```{r before-after-table, echo=FALSE}
+before_after |>
+  mutate(
+    corridor_rate_ratio = round(corridor_rate_ratio, 2),
+    boot_ci             = paste0("[", round(boot_ci_lo, 2), ", ", round(boot_ci_hi, 2), "]"),
+    city_rate_ratio      = round(city_rate_ratio, 2),
+    interaction_rr       = round(interaction_rr, 2),
+    interaction_ci        = paste0("[", round(interaction_rr_ci_lo, 2), ", ",
+                                   round(interaction_rr_ci_hi, 2), "]"),
+    interaction_p         = format.pval(interaction_p, digits = 2)
+  ) |>
+  select(corridor, install_year, corridor_before, corridor_after, corridor_rate_ratio,
+         boot_ci, city_rate_ratio, interaction_rr, interaction_ci, interaction_p) |>
+  knitr::kable(
+    col.names = c("Corridor", "Install year", "Before", "After", "Rate ratio",
+                  "Bootstrap 95% CI", "Citywide ratio",
+                  "Interaction RR (vs citywide)", "Interaction 95% CI", "Interaction p"),
+    caption = "Before and after KSI counts in a 150 metre buffer, five years each side of installation. Bootstrap CI is 2,000 resamples of that corridor's own events. The interaction columns come from a Poisson model of count by period by location (corridor vs citywide) and test whether the corridor's change differs from the citywide change over the same years."
+  )
+```
+
+```{r before-after-figure, fig.cap="Figure 18: Collision rate ratio (after/before) for each of the three mechanically selected corridors, next to the citywide rate ratio over the same five-year window. A ratio below 1.0 means collisions fell; a corridor bar below its citywide bar means it fell by more than the citywide trend. Error bars are a 2,000-iteration bootstrap 95% confidence interval on each corridor's own ratio. Wide error bars mean the point estimate is not well pinned down by that corridor's small event count.", fig.align="center", fig.height=6, fig.width=9}
+corridor_bars <- before_after |>
+  transmute(corridor, rate_ratio = corridor_rate_ratio,
+            ci_lo = boot_ci_lo, ci_hi = boot_ci_hi,
+            group = "Corridor buffer (150m)")
+
+city_bars <- before_after |>
+  transmute(corridor, rate_ratio = city_rate_ratio,
+            ci_lo = NA_real_, ci_hi = NA_real_,
+            group = "Citywide (excl. corridor)")
+
+before_after_long <- bind_rows(corridor_bars, city_bars)
+
+ggplot(before_after_long, aes(x = corridor, y = rate_ratio, fill = group)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, colour = "white") +
+  geom_errorbar(aes(ymin = ci_lo, ymax = ci_hi),
+                position = position_dodge(width = 0.7), width = 0.15,
+                colour = "grey20", linewidth = 0.6, na.rm = TRUE) +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "grey30", linewidth = 0.7) +
+  geom_text(aes(label = round(rate_ratio, 2)),
+            position = position_dodge(width = 0.7), vjust = -0.5,
+            size = 3.5, fontface = "bold") +
+  scale_fill_manual(values = c(
+    "Corridor buffer (150m)"    = COL_NETWORK,
+    "Citywide (excl. corridor)" = COL_ACCENT
+  ), name = NULL) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    title    = "Collision Rate Change After Installation: Corridor vs Citywide",
+    subtitle = "Dashed line at 1.0 = no change",
+    x = "Corridor", y = "Rate Ratio (After / Before)"
+  ) +
+  theme_project
+```
+
+**Analysis:** All three of the mechanically selected corridors show a
+rate ratio below 1.0, meaning fewer collisions after installation than
+before, but the confidence intervals tell three different stories.
+Richmond St W falls from 38 collisions before to 6 after, a ratio of
+0.16, with a bootstrap 95 percent interval of roughly 0.05 to 0.33 that
+sits entirely below the citywide ratio of 0.78 over the same years. The
+interaction model confirms this. Richmond St W's before to after change
+is significantly larger than the citywide change, interaction rate ratio
+around 0.20, p well under 0.001. This is the one corridor in this section
+where the data supports saying something happened here beyond the general
+citywide decline. Woodbine Ave and Simcoe St both show point estimates
+below the citywide ratio too, but their bootstrap intervals are wide
+enough to include 1.0 or close to it, and neither corridor's interaction
+term is statistically significant at the conventional 0.05 threshold.
+For these two, the honest read is that the data cannot distinguish a real
+corridor specific effect from the citywide trend plus noise, given only
+11 before-period collisions at each site.
+
+One limitation applies to the interaction p-values specifically, not to
+the bootstrap intervals. Each corridor's interaction model is fit on just
+four aggregate counts, before and after, corridor and citywide, so the
+model is saturated and has zero residual degrees of freedom. That means
+there is no way to check whether the data are overdispersed relative to
+a Poisson assumption, unlike the pooled income model in the multi-year
+income comparison, where dispersion could be estimated and was found to
+be far above 1. If these
+counts are similarly overdispersed, the interaction p-values reported
+here are likely too optimistic, understating the true uncertainty. The
+bootstrap intervals do not carry this assumption, since they resample
+the raw events directly rather than relying on Poisson variance, which
+is why they are treated as the more trustworthy of the two uncertainty
+measures in this section when the two disagree.
+
+Choosing the corridor set by a fixed rule rather than by hand, and
+reporting uncertainty rather than a bare ratio, is a deliberately
+cautious way to run this kind of study. Bloor St W does not pass the
+mechanical selection rule because its protected lane was built in
+phases across nearly a decade, not as one identifiable event, so it is
+not a fair candidate for a single before and after comparison in the
+first place. Of the three corridors that do qualify, only Richmond St W
+shows a statistically detectable corridor-specific change. None of this
+shows causation. Streets that get protected cycling infrastructure are
+not picked at random, and this section still cannot separate the effect
+of the infrastructure from the reasons that street was chosen for it in
+the first place.
+
+### Buffer Width Sensitivity Check
+
+Everything above uses a 150 metre buffer around each corridor. That
+number was a choice, not something the data dictated, so this checks
+whether a wider buffer changes the picture, particularly for Woodbine Ave
+and Simcoe St, whose small event counts are the main weakness in this
+section. We rerun the same before and after counts, the same citywide
+baseline, and the same interaction model at a 250 metre buffer instead of
+150 metres.
+
+```{r buffer-sensitivity, echo=FALSE}
+analyse_corridor_buffer <- function(street, dominant_year, buf_dist) {
+  seg <- protected_infra_sf |> filter(street == !!street, install_year == !!dominant_year)
+  buf <- st_union(st_buffer(seg, buf_dist))
+  hit <- st_intersects(cyclists_utm, buf, sparse = FALSE)[, 1]
+  sub  <- cyclists_utm[hit, ]  |> st_drop_geometry()
+  rest <- cyclists_utm[!hit, ] |> st_drop_geometry()
+
+  before_n <- sub  |> filter(year >= dominant_year - 5, year < dominant_year) |> nrow()
+  after_n  <- sub  |> filter(year >= dominant_year,     year < dominant_year + 5) |> nrow()
+  city_before <- rest |> filter(year >= dominant_year - 5, year < dominant_year) |> nrow()
+  city_after  <- rest |> filter(year >= dominant_year,     year < dominant_year + 5) |> nrow()
+
+  glm_data <- tibble::tribble(
+    ~period,   ~location,   ~count,
+    "before",  "corridor",  before_n,
+    "after",   "corridor",  after_n,
+    "before",  "citywide",  city_before,
+    "after",   "citywide",  city_after
+  ) |>
+    mutate(period = factor(period, levels = c("before", "after")),
+           location = factor(location, levels = c("citywide", "corridor")),
+           window_years = 5)
+
+  fit <- glm(count ~ period * location + offset(log(window_years)), family = poisson, data = glm_data)
+  int_row <- summary(fit)$coefficients["periodafter:locationcorridor", ]
+
+  tibble(corridor = street, buffer_m = buf_dist,
+         before_n = before_n, after_n = after_n, combined_n = before_n + after_n,
+         rate_ratio = after_n / before_n,
+         interaction_rr = exp(int_row["Estimate"]),
+         interaction_p  = int_row["Pr(>|z|)"])
+}
+
+sensitivity <- bind_rows(
+  purrr::pmap_dfr(selected_corridors |> select(street, dominant_year),
+                  function(street, dominant_year) analyse_corridor_buffer(street, dominant_year, 150)),
+  purrr::pmap_dfr(selected_corridors |> select(street, dominant_year),
+                  function(street, dominant_year) analyse_corridor_buffer(street, dominant_year, 250))
+)
+
+sensitivity |>
+  mutate(rate_ratio = round(rate_ratio, 2),
+         interaction_rr = round(interaction_rr, 2),
+         interaction_p  = format.pval(interaction_p, digits = 2)) |>
+  knitr::kable(
+    col.names = c("Corridor", "Buffer (m)", "Before", "After", "Combined n",
+                  "Rate ratio", "Interaction RR", "Interaction p"),
+    caption = "Before/after corridor counts and interaction test at 150m (original) vs 250m (sensitivity check)."
+  )
+```
+
+**Analysis:** Widening the buffer to 250 metres does not rescue Woodbine
+Ave or Simcoe St from their small-n problem, and it does not change which
+corridors are statistically significant. Woodbine's combined event count
+moves from 17 to 18, essentially unchanged, and its interaction p-value
+stays firmly non-significant. Simcoe St's combined count moves from 15 to
+21, a real increase, but its interaction rate ratio and p-value land in
+roughly the same place as before, still short of conventional
+significance. Richmond St W stays significant at both buffer widths.
+Nothing here suggests the 150 metre choice was hiding a stronger effect
+at Woodbine or Simcoe that a wider buffer would have uncovered. If
+anything this is a point in favour of the original 150 metre results,
+they are not an artifact of an unusually narrow buffer, small-n
+corridors are just small-n corridors, and a bigger circle does not add
+much protected-corridor exposure at these two, they are simply short
+segments in comparatively low-collision parts of the city.
+
+### Mechanism Check: Did Ridership Rise Near Richmond St W
+
+Richmond St W is the one corridor in this section with a statistically
+detectable drop in collisions relative to the citywide trend. If that
+drop reflects the protected lane doing what it was meant to do, drawing
+more people onto a safer facility, ridership near the corridor should
+have grown, not just collisions falling. We checked this against the
+earliest bike share data available.
+
+This check ran into a real limit worth stating plainly before the
+numbers. Richmond St W's cycle track was installed in 2014. Toronto's
+bike share system's own trip records only begin in October 2014, the
+same year. There is no meaningful before period for ridership here, the
+data simply does not reach back far enough, so this cannot be a true
+before and after comparison the way the collision counts above are. What
+it can be is a growth check, comparing ridership at stations near the
+corridor shortly after installation to ridership at the same stations
+in 2023.
+
+```{r richmond-mechanism, echo=FALSE}
+richmond_check <- read_csv("richmond_corridor_bikeshare_check.csv", show_col_types = FALSE)
+knitr::kable(richmond_check,
+             col.names = c("Period", "Stations matched", "Total trips"),
+             caption = "Bike share trips at the 10 stations within 400 metres of Richmond St W's 2014 cycle track. The 2014-2015 period covers 7 of 12 months, the months available in that year's source file. 2023 covers all 12 months.")
+```
+
+**Analysis:** Even on a partial year, ridership near the corridor in
+2014 to 2015 was already substantial, 113,193 trips across the 7
+available months. By 2023, the same station set recorded 272,449 trips
+across a full year. The two periods are not matched in length or season,
+the earlier count is missing five months including the spring ramp up,
+so we do not compute a precise growth ratio from this, doing so would
+overstate the precision this comparison actually has. What can be said
+is qualitative and still useful. Ridership near Richmond St W was not
+small to begin with and grew substantially in the years after the
+corridor's installation, which is consistent with, though does not
+prove, the corridor drawing in more riders rather than simply becoming
+safer for a fixed number of people already using it. This supports
+reading Richmond St W's before-and-after result above as consistent with
+an exposure based safety story rather than against one, though the data
+available cannot rule out other explanations for the corridor's collision decline
+either.
+
+---
+
+## Multi-Year Income Comparison
+
+The BYM model in Question 2 uses a single snapshot of 2021 income. This
+stretch section checks whether the income and accident relationship looks
+different using three census vintages, 2006, 2016, and 2021. The 2011
+census is not used. The 2011 count replaced the mandatory long form
+census with a voluntary survey, and it is well documented to undercount
+lower income and immigrant households more than higher income
+households. Mixing that data into a trend line would bias the trend in
+a direction we cannot easily correct for, so 2011 is skipped rather than
+patched over. Full detail is in `LOG.md`.
+
+Census tract boundaries are not identical across these three years, and
+we do not attempt formal areal interpolation to correct for that. Instead
+we reuse the same method already used earlier in this report. The income
+value at each census tract's centroid is joined to whichever neighbourhood
+polygon contains it, separately for each census year. Neighbourhood
+boundaries are treated as fixed over this period, since Toronto's
+neighbourhood polygons have not changed in this window. This is a
+simplification. A tract that changed shape between 2006 and 2021 is still
+represented by a single centroid point in each year, not by its full
+overlap area.
+
+```{r multiyear-income-setup, results='hide', cache=TRUE}
+income_specs <- list(
+  CA06 = list(inc = "v_CA06_2030", pop = "v_CA06_1"),
+  CA16 = list(inc = "v_CA16_2398", pop = "v_CA16_401"),
+  CA21 = list(inc = "v_CA21_907",  pop = "v_CA21_1")
+)
+
+# Project-local RDS cache, independent of cancensus's own internal caching.
+# Once a year's data has been pulled successfully one time, every later
+# render loads it straight from disk and never calls the API again for
+# that year, regardless of quota status.
+dir.create("data_cache", showWarnings = FALSE)
+
+pull_income_year <- function(dataset, inc_vec, pop_vec, year_label) {
+  cache_file <- file.path("data_cache", paste0("income_", year_label, ".rds"))
+
+  if (file.exists(cache_file)) {
+    return(readRDS(cache_file))
+  }
+
+  raw <- get_census(
+    dataset = dataset, regions = list(CMA = "35535"),
+    vectors = c(inc_vec, pop_vec),
+    level = "CT", geo_format = "sf", quiet = TRUE
+  )
+  inc_col <- grep(inc_vec, names(raw), value = TRUE)[1]
+  pop_col <- grep(pop_vec, names(raw), value = TRUE)[1]
+
+  result <- raw |>
+    rename(median_income = all_of(inc_col), population = all_of(pop_col)) |>
+    select(median_income, population, geometry) |>
+    st_transform(4326) |>
+    st_centroid() |>
+    st_join(neighbourhoods) |>
+    st_drop_geometry() |>
+    filter(!is.na(neighbourhood)) |>
+    group_by(neighbourhood) |>
+    summarise(
+      median_income = median(median_income, na.rm = TRUE),
+      population    = sum(population,    na.rm = TRUE)
+    ) |>
+    mutate(census_year = year_label)
+
+  saveRDS(result, cache_file)
+  result
+}
+
+income_by_year <- bind_rows(
+  pull_income_year("CA06", income_specs$CA06$inc, income_specs$CA06$pop, 2006),
+  pull_income_year("CA16", income_specs$CA16$inc, income_specs$CA16$pop, 2016),
+  pull_income_year("CA21", income_specs$CA21$inc, income_specs$CA21$pop, 2021)
+)
+
+income_trend <- income_by_year |>
+  left_join(
+    accidents_per_hood |> st_drop_geometry() |> select(neighbourhood, n_accidents),
+    by = "neighbourhood"
+  ) |>
+  filter(!is.na(median_income), population > 100) |>
+  mutate(accidents_per1k = n_accidents * 1000 / population)
+```
+
+```{r multiyear-income-model, echo=FALSE}
+# Pooled test of whether the income to accident relationship differs by
+# census year, replacing an eyeballed "the three panels look similar"
+# argument with an actual interaction test. Income is standardized within
+# each census year separately, since nominal dollar levels are not
+# comparable across 2006, 2016, and 2021, and a shared global standardization
+# would let that scale difference leak into the interaction estimate.
+pooled_income <- income_trend |>
+  group_by(census_year) |>
+  mutate(income_std = scale(median_income)[, 1]) |>
+  ungroup() |>
+  mutate(year_factor = factor(census_year))
+
+m_pois <- glm(n_accidents ~ income_std * year_factor + offset(log(population / 1000)),
+              family = poisson, data = pooled_income)
+dispersion <- sum(residuals(m_pois, type = "pearson")^2) / df.residual(m_pois)
+
+# The dispersion estimate is well above 1, so a plain Poisson model
+# understates the standard errors. A quasi-Poisson model is used instead,
+# which keeps the same point estimates but corrects the standard errors
+# for that extra neighbourhood level variability.
+m_qp <- glm(n_accidents ~ income_std * year_factor + offset(log(population / 1000)),
+            family = quasipoisson, data = pooled_income)
+
+interaction_test <- drop1(m_qp, test = "F")
+
+cat("Pearson dispersion estimate from the Poisson fit:", round(dispersion, 1),
+    "(quasi-Poisson used because this is well above 1)\n\n")
+cat("F test on the full income by year interaction block:\n")
+print(interaction_test)
+```
+
+```{r multiyear-income-figure, fig.cap="Figure 19: Income versus accident rate per neighbourhood in three census years. Each year uses that year's own income snapshot joined to the same fixed neighbourhood boundaries. 2011 is excluded due to known National Household Survey data quality issues (see text).", fig.align="center", fig.height=6, fig.width=12}
+ggplot(income_trend, aes(x = median_income, y = accidents_per1k)) +
+  geom_point(alpha = 0.5, colour = COL_INJURY, size = 1.6) +
+  geom_smooth(method = "lm", se = TRUE, colour = COL_FATAL, fill = COL_FATAL,
+              alpha = 0.15, linewidth = 1) +
+  facet_wrap(~ census_year, scales = "free_x") +
+  scale_x_continuous(labels = dollar_format(prefix = "$", big.mark = ",")) +
+  labs(
+    title = "Income vs Accident Rate Across Three Census Years",
+    x = "Median After-Tax Household Income ($, nominal, not inflation adjusted)",
+    y = "Accidents per 1,000 People"
+  ) +
+  theme_project
+```
+
+**Analysis:** The negative relationship between income and accident rate
+seen in 2021 is not a one time result. A similar weak negative slope
+appears in 2006 and 2016 as well. Income values here are nominal dollars
+for each census year, not adjusted for inflation, so the x axis position
+of a given neighbourhood shifts rightward over time partly because prices
+rose, not only because real income rose. This chart is meant to show
+whether the shape of the relationship is stable, not to compare exact
+dollar values across years.
+
+Rather than resting that claim on the three panels looking visually
+similar, a pooled quasi-Poisson model of accident counts by income, year,
+and their interaction, with a population offset, tests it directly. The
+dispersion estimate from a plain Poisson fit is about 22, far above the
+value of 1 a well specified Poisson count model would show, which is why
+the quasi-Poisson version is used for inference here rather than plain
+Poisson. Across the whole income by year interaction block, the F test
+gives a p-value of about 0.79. There is no statistical evidence that the
+income to accident relationship changed across these three census years,
+a real test backing up what the panels suggest visually. The consistent
+weak negative slope across all three years supports the Question 2
+finding that income has at most a small independent link to cycling
+accident rates, though as with the BYM model this is a correlational
+reading, not a causal one.
+
+---
+
+## Finer-Grained Spatial Model: The Hex Grid
+
+The BYM model in Question 2 works at the neighbourhood level, 158 zones
+across the city. That is a coarse unit for a question about where exactly
+risk is highest. This section tries a finer spatial grid instead of
+individual intersections. Intersections were considered and rejected.
+Most intersections in Toronto have zero collisions in eighteen years of
+data, so a model at that level is mostly modelling noise, not signal.
+
+Cell size is chosen by convergence, not by preference. A 500 metre
+hexagon grid, the size in the original future work note, produces 3,160
+cells with only 16 percent ever recording a collision, and a Poisson
+besag model on that grid triggers a persistent INLA warning about its
+internal variational correction step diverging, consistent across every
+run, not a one-off. Results built on a model that will not converge
+cleanly are not reported here. A coarser 1,000 metre hexagon grid, 828
+cells with 40 percent recording at least one collision, converges
+cleanly with no warnings at all, and is the resolution used throughout
+this section.
+
+This model now uses three covariates, cycling infrastructure density, a
+road class mix measure, and bike share trip volume. The cycling network
+data has a road class field on paper, but every single row of it is
+blank, so it cannot be used. Using the KSI data's own road class field
+was considered and rejected for a different reason. That field describes
+the road a collision happened on, which is part of the outcome this
+model counts, so a covariate built from it would partly be built from
+its own answer. Instead we bring in the City's Centreline street
+network, already used once elsewhere in this report to locate bike
+counters, and take its independent road classification, Major Arterial,
+Minor Arterial, Collector, and Local, to compute the proportion of each
+hex cell's total road length that is Major Arterial. This is real road
+infrastructure data, not something derived from the collisions being
+modelled.
+
+The third covariate answers a direct question raised by the
+exposure-adjusted rates analysis above. All the infrastructure and road
+class measures used in this model are
+proxies for how much cycling actually happens in a cell, not direct
+measures of it. Bike share trip volume, aggregated to this same hex
+grid, is the closest thing available to a direct measure. Adding it lets
+this model ask whether infrastructure density still predicts collisions
+once real measured exposure is controlled for, or whether infrastructure
+was only ever standing in for exposure. Either answer is informative.
+This is not a test built to make a covariate look better, it was run
+because the question matters for how to read every earlier result in
+this report that touches infrastructure.
+
+```{r hex-setup, echo=FALSE}
+hex_grid <- st_make_grid(toronto_boundary, cellsize = 1000, square = FALSE)
+hex_sf <- st_sf(hex_id = seq_along(hex_grid), geometry = hex_grid)
+hex_clip <- hex_sf[st_intersects(hex_sf, toronto_boundary, sparse = FALSE)[, 1], ]
+hex_clip$hex_id <- seq_len(nrow(hex_clip))
+
+hex_clip$n_ksi <- lengths(st_intersects(hex_clip, cyclists_utm))
+
+infra_per_hex <- st_join(hex_clip, cycling_network_utm |> select(length_km),
+                          join = st_intersects) |>
+  st_drop_geometry() |>
+  group_by(hex_id) |>
+  summarise(infra_km = sum(length_km, na.rm = TRUE))
+
+hex_clip <- hex_clip |>
+  left_join(infra_per_hex, by = "hex_id") |>
+  mutate(infra_km = ifelse(is.na(infra_km), 0, infra_km))
+
+# Independent road classification, from the City's Centreline layer,
+# already downloaded once for the bike counter geocoding earlier in this
+# report. Saved locally as road_class_segments.gpkg so this does not
+# depend on a fresh network call at render time.
+road_segments <- st_read("road_class_segments.gpkg", quiet = TRUE) |>
+  st_transform(32617) |>
+  mutate(length_km = as.numeric(st_length(geom)) / 1000)
+
+road_per_hex <- st_join(hex_clip, road_segments |> select(road_class, length_km),
+                         join = st_intersects) |>
+  st_drop_geometry() |>
+  group_by(hex_id, road_class) |>
+  summarise(km = sum(length_km, na.rm = TRUE), .groups = "drop") |>
+  tidyr::pivot_wider(names_from = road_class, values_from = km, values_fill = 0)
+
+hex_clip <- hex_clip |> left_join(road_per_hex, by = "hex_id")
+for (col in c("Major Arterial", "Minor Arterial", "Collector", "Local")) {
+  if (!col %in% names(hex_clip)) hex_clip[[col]] <- 0
+  hex_clip[[col]][is.na(hex_clip[[col]])] <- 0
+}
+hex_clip$total_road_km <- hex_clip[["Major Arterial"]] + hex_clip[["Minor Arterial"]] +
+  hex_clip[["Collector"]] + hex_clip[["Local"]]
+# Cells with no classified road length at all, mostly parkland, water, or
+# the city edge, get a share of 0 rather than an undefined value.
+hex_clip$major_arterial_share <- ifelse(hex_clip$total_road_km > 0,
+                                        hex_clip[["Major Arterial"]] / hex_clip$total_road_km, 0)
+
+# Bike share trip volume per hex, geocoded stations from the
+# exposure-adjusted rates analysis earlier in this report, station level
+# 2023 totals joined by location rather than by neighbourhood so this
+# lines up with the hex grid rather than neighbourhood boundaries.
+bikeshare_geo <- read_csv("bikeshare_stations_geocoded_2023.csv", show_col_types = FALSE) |>
+  st_as_sf(coords = c("lon", "lat"), crs = 4326) |>
+  st_transform(32617)
+
+bikeshare_per_hex <- st_join(hex_clip, bikeshare_geo |> select(n), join = st_intersects) |>
+  st_drop_geometry() |>
+  group_by(hex_id) |>
+  summarise(bikeshare_trips = sum(n, na.rm = TRUE))
+
+hex_clip <- hex_clip |>
+  left_join(bikeshare_per_hex, by = "hex_id") |>
+  mutate(bikeshare_trips = ifelse(is.na(bikeshare_trips), 0, bikeshare_trips))
+
+cat("Hex cells:", nrow(hex_clip), "\n")
+cat("Cells with at least one KSI:", sum(hex_clip$n_ksi > 0),
+    sprintf("(%.0f%%)", 100 * mean(hex_clip$n_ksi > 0)), "\n")
+cat("Cells with no classified road data:", sum(hex_clip$total_road_km == 0), "\n")
+cat("Cells with any bike share trips:", sum(hex_clip$bikeshare_trips > 0),
+    sprintf("(%.0f%%)", 100 * mean(hex_clip$bikeshare_trips > 0)), "\n")
+```
+
+```{r hex-model, results='hide'}
+hex_sp  <- as(hex_clip, "Spatial")
+hex_nb  <- poly2nb(hex_sp, queen = TRUE)
+nb2INLA("hex_adj.graph", hex_nb)
+hex_g   <- inla.read.graph("hex_adj.graph")
+
+hex_inla <- hex_clip |>
+  st_drop_geometry() |>
+  mutate(id = hex_id, id2 = hex_id,
+         infra_std     = scale(infra_km)[, 1],
+         arterial_std  = scale(major_arterial_share)[, 1],
+         bikeshare_std = scale(log1p(bikeshare_trips))[, 1])
+
+# One covariate version, kept for direct comparison against the two and
+# three covariate versions below.
+hex_formula_1cov <- n_ksi ~ infra_std +
+  f(id,  model = "besag", graph = hex_g) +
+  f(id2, model = "iid")
+
+hex_bym_1cov <- inla(
+  hex_formula_1cov, family = "poisson", data = hex_inla,
+  control.predictor = list(compute = TRUE, link = 1),
+  control.compute   = list(dic = TRUE, waic = TRUE),
+  control.inla      = list(strategy = "laplace")
+)
+
+# Two covariate version. Same grid, same random effect structure, one
+# extra fixed effect.
+hex_formula_2cov <- n_ksi ~ infra_std + arterial_std +
+  f(id,  model = "besag", graph = hex_g) +
+  f(id2, model = "iid")
+
+hex_bym_2cov <- inla(
+  hex_formula_2cov, family = "poisson", data = hex_inla,
+  control.predictor = list(compute = TRUE, link = 1),
+  control.compute   = list(dic = TRUE, waic = TRUE),
+  control.inla      = list(strategy = "laplace")
+)
+
+# Three covariate version. Adds bike share trip volume, the closest
+# direct measure of cycling exposure available, alongside the two proxy
+# measures already in the model.
+hex_formula_3cov <- n_ksi ~ infra_std + arterial_std + bikeshare_std +
+  f(id,  model = "besag", graph = hex_g) +
+  f(id2, model = "iid")
+
+hex_bym_3cov <- inla(
+  hex_formula_3cov, family = "poisson", data = hex_inla,
+  control.predictor = list(compute = TRUE, link = 1),
+  control.compute   = list(dic = TRUE, waic = TRUE),
+  control.inla      = list(strategy = "laplace")
+)
+
+# Use the three covariate version as the primary model for the rest of
+# this section, since it converged cleanly with no warnings and fits
+# better than the one and two covariate versions, see the comparison below.
+hex_bym <- hex_bym_3cov
+```
+
+```{r hex-summary, echo=FALSE}
+cat("Convergence check, full warnings list from all three model fits above:\n")
+print(warnings())
+
+model_compare <- tibble::tibble(
+  Model = c("One covariate (infrastructure only)",
+           "Two covariate (infrastructure + arterial share)",
+           "Three covariate (infrastructure + arterial share + bike share exposure)"),
+  DIC   = c(round(hex_bym_1cov$dic$dic, 1), round(hex_bym_2cov$dic$dic, 1), round(hex_bym_3cov$dic$dic, 1)),
+  WAIC  = c(round(hex_bym_1cov$waic$waic, 1), round(hex_bym_2cov$waic$waic, 1), round(hex_bym_3cov$waic$waic, 1))
+)
+knitr::kable(model_compare, caption = "Model fit comparison. Lower DIC and WAIC are better. All three are Poisson besag/iid models on the same 1,000 metre grid.")
+
+hex_fx <- hex_bym_3cov$summary.fixed
+tibble::tibble(
+  Term       = rownames(hex_fx),
+  Mean       = round(hex_fx[, "mean"], 3),
+  `2.5% CI`  = round(hex_fx[, "0.025quant"], 3),
+  `97.5% CI` = round(hex_fx[, "0.975quant"], 3)
+) |> knitr::kable(caption = "Three covariate hex grid BYM fixed effects (Poisson, log link, 1,000 metre grid, no divergence warnings)")
+```
+
+```{r hex-map, fig.cap="Figure 20: Fitted collision rate from the 1,000 metre hex grid BYM model, three covariate version. This shows finer spatial structure than the neighbourhood level BYM model in Figure 10, now controlling for cycling infrastructure density, major arterial road share, and directly measured bike share exposure.", fig.align="center", fig.height=9, fig.width=12, dpi=150}
+hex_clip$fitted_rate <- hex_bym_3cov$summary.fitted.values$mean
+hex_clip_wgs <- st_transform(hex_clip, 4326)
+
+tm_shape(hex_clip_wgs) +
+  tm_polygons(
+    fill        = "fitted_rate",
+    fill.scale  = tm_scale_continuous(values = "viridis"),
+    fill.legend = tm_legend(title = "Fitted KSI\ncount per cell"),
+    col = NA
+  ) +
+  tm_shape(neighbourhoods) +
+  tm_borders(col = "white", lwd = 0.4) +
+  tm_scalebar(breaks = c(0, 5, 10), position = c("left", "bottom")) +
+  tm_compass(position = c("right", "top"), size = 1.2) +
+  tm_title("Hex Grid BYM Fitted Collision Count (1,000m cells, three covariates)") +
+  tm_layout(frame = FALSE, legend.outside = TRUE, bg.color = "white")
+```
+
+**Analysis:** Adding bike share exposure produces the largest fit
+improvement of the three covariates added to this model so far. DIC
+drops a further 6 points and WAIC drops a further 50 points relative to
+the two covariate version, on the same grid and the same random effect
+structure, and there are no convergence warnings at any of the three
+covariate counts. The bike share coefficient is the largest of the three
+and clearly significant, 95 percent interval entirely above 0. This
+matches the neighbourhood level exposure regression earlier in this
+report ("Does Cycling Exposure Predict Collision Counts"), now shown to
+hold at a finer spatial resolution too.
+
+The more important result is what happens to infrastructure. Its
+coefficient drops from about 0.15 in the two covariate model to about
+0.04 here, and its 95 percent interval now crosses 0, no longer a
+significant predictor once real measured exposure is in the model.
+Arterial road share also drops somewhat, from about 0.30 to about 0.23,
+but stays clearly significant, interval entirely above 0. Read together,
+this says something specific. Most of what looked like an independent
+infrastructure effect in the two covariate model was infrastructure
+density standing in for cycling exposure it does not directly measure.
+Once exposure is measured directly instead of proxied, that effect
+mostly disappears. Arterial road classification is different. It keeps
+an independent association with collision counts even after controlling
+for how much cycling actually happens in a cell, consistent with faster
+and higher volume roads carrying real added risk beyond just having more
+cyclists on them.
+
+This is not a result we expected to get cleanly in either direction
+before running it. It could as easily have shown infrastructure holding
+its effect after exposure was added, which would have been a different,
+also informative finding. It changes how the earlier infrastructure
+results in this report should be read. Figure 6's positive correlation
+between infrastructure density and raw accident rate, and the two
+covariate hex model's infrastructure coefficient, are both consistent
+with infrastructure density mainly tracking where cyclists already are,
+not adding risk or protection independently of that. The arterial road
+finding is the one part of this model's story that exposure does not
+explain away. The hex grid model still shows the same downtown hotspot
+as the KDE map in Figure 3 and the neighbourhood BYM map in Figure 10,
+now at a finer resolution and with a more completely controlled
+comparison than a single-covariate model could offer. This is reported
+at 1,000 metres rather than 500 metres, for the convergence reasons
+described above and documented further in `LOG.md`.
+
+---
+
+# Reproducibility
+
+This report is designed to render from a clean clone of the project folder with no manual data download step.
+
+## Software requirements
+
+- R (4.2 or later) and Quarto
+- CRAN packages: `sf`, `terra`, `tidyverse`, `tmap` (v4 syntax), `cancensus`, `httr`, `spatstat`, `spdep`, `ggplot2`, `lubridate`, `gridExtra`, `scales`, `RColorBrewer`
+- `INLA`, installed from its own repository rather than CRAN:
+  ```r
+  install.packages("INLA", repos = c(getOption("repos"), INLA = "https://inla.r-inla-download.org/R/stable"), dep = TRUE)
+  ```
+- A free Statistics Canada `cancensus` API key, set once via:
+  ```r
+  cancensus::set_cancensus_api_key("YOUR_KEY_HERE", install = TRUE)
+  ```
+  Get a key at [censusmapper.ca](https://censusmapper.ca/users/sign_up).
+
+## Data: live API pulls versus committed files
+
+**Fetched live from public APIs, cached locally after the first run:**
+
+| Dataset | Source | Cache location |
+|---|---|---|
+| Cyclist KSI collisions | Toronto Police Service ArcGIS FeatureServer (`CYCLIST_KSI`) | `data_cache/raw/cyclist_ksi.rds` |
+| Neighbourhood boundaries | City of Toronto Open Data (CKAN), package `Neighbourhoods` | `data_cache/raw/neighbourhoods/` |
+| Cycling network | City of Toronto Open Data (CKAN), package `Cycling Network` | `data_cache/raw/cycling_network/` |
+| Census income (2006, 2016, 2021) | Statistics Canada via `cancensus` | `cancensus_cache/`, `data_cache/income_*.rds` |
+
+Each of these downloads once and reuses the cache on every subsequent render. To force a fresh pull (for example, if the City updates the underlying dataset), delete the relevant cache folder or file and re-render.
+
+**Committed as static files in the project folder, not re-fetched at render time:**
+
+`bike_counter_locations.csv`, `bike_counter_shortterm_agg.csv`, `road_class_segments.gpkg`, `bikeshare_by_hood_2023.csv`, `bikeshare_monthly_multiyear.csv`, `bikeshare_stations_geocoded_2023.csv`, `richmond_corridor_bikeshare_check.csv`.
+
+These are not simple one-shot API pulls. Each is the output of a bespoke geocoding or aggregation step run once against a much larger public source (for example, Bike Share Toronto's full 2023 trip-level ridership file has 11.4 million rows; the City's Centreline street network file is roughly 36 MB), then reduced to a small table that this report actually needs. Re-running that aggregation on every render would add minutes of runtime for no change in output, since the underlying open datasets are static snapshots. The original source dataset, the exact join/aggregation logic, and the reasoning for each of these derived files are documented in `LOG.md`. Anyone who wants to regenerate one from scratch can follow that entry back to its source API.
+
+## Full re-render
+
+```bash
+quarto render analysis.qmd
+```
+
+On a clean clone with no cache directories, the first render will download the four live-sourced datasets above (a few minutes depending on connection speed) and then proceed exactly as a cached render would. All later re-renders reuse the caches and only re-run the statistical models and figures.

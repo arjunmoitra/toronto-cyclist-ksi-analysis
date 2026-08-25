@@ -1,0 +1,113 @@
+/* ---- Typography ---- */
+body {
+  font-family: -apple-system, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+  line-height: 1.65;
+  color: #232323;
+}
+
+h1, h2, h3, h4 {
+  font-family: -apple-system, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+  color: #1a1a2e;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+h1.title {
+  font-size: 2.1rem;
+  border-bottom: 3px solid #2166ac;
+  padding-bottom: 0.5rem;
+}
+
+.subtitle {
+  color: #5a5a5a;
+  font-weight: 400;
+  font-size: 1.2rem;
+}
+
+h1:not(.title) {
+  margin-top: 3rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid #e2e2e2;
+  font-size: 1.65rem;
+}
+
+h2 {
+  margin-top: 2.2rem;
+  font-size: 1.35rem;
+  color: #26466d;
+}
+
+h3 {
+  margin-top: 1.6rem;
+  font-size: 1.1rem;
+  color: #34597e;
+}
+
+/* ---- "Analysis:" callouts ---- */
+/* Quarto wraps **Analysis:** paragraphs as plain <p><strong>; style the
+   whole paragraph that starts with that strong tag as a callout block. */
+p:has(> strong:first-child) {
+  background: #f4f8fb;
+  border-left: 4px solid #2166ac;
+  padding: 0.85rem 1.1rem;
+  border-radius: 0 6px 6px 0;
+  margin: 1.1rem 0;
+}
+
+/* ---- Figures ---- */
+figure {
+  margin: 1.75rem 0;
+  text-align: center;
+}
+
+figcaption, .figure-caption {
+  font-size: 0.88rem;
+  color: #5a5a5a;
+  line-height: 1.5;
+  max-width: 92%;
+  margin: 0.6rem auto 0;
+  text-align: left;
+}
+
+.quarto-figure img,
+figure img {
+  border-radius: 6px;
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.08);
+}
+
+/* ---- Tables ---- */
+table {
+  font-size: 0.92rem;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.06);
+}
+
+caption {
+  font-size: 0.85rem;
+  color: #5a5a5a;
+  font-style: italic;
+  padding-bottom: 0.4rem;
+}
+
+/* ---- Code blocks ---- */
+pre.sourceCode, div.sourceCode {
+  border-radius: 6px;
+  font-size: 0.85rem;
+}
+
+.cell-output-stdout pre {
+  background: #fbfbfb;
+  border-left: 3px solid #cfd8dc;
+  border-radius: 0 4px 4px 0;
+}
+
+/* ---- TOC ---- */
+#TOC {
+  font-size: 0.88rem;
+}
+
+/* ---- Horizontal rules used as section breaks ---- */
+hr {
+  border: none;
+  border-top: 1px solid #e2e2e2;
+  margin: 2.5rem 0;
+}
