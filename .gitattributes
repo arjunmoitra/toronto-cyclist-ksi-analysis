@@ -1,2 +1,6 @@
 # The rendered report is generated from analysis.qmd, so keep it out of the language statistics.
 analysis.html linguist-generated=true
+# GitHub does not recognise Quarto. The document is R code chunks and prose, so count it as R.
+analysis.qmd linguist-language=R
+# The stylesheet only styles the rendered report.
+styles.css linguist-documentation
