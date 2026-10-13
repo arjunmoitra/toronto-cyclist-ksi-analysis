@@ -1,0 +1,2 @@
+# The rendered report is generated from analysis.qmd, so keep it out of the language statistics.
+analysis.html linguist-generated=true
